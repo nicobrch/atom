@@ -21,7 +21,7 @@ func Defaults() Config {
 
 func Load(workdir string) (Config, error) {
 	cfg := Defaults()
-	path := filepath.Join(workdir, ".rivet", "config.json")
+	path := filepath.Join(workdir, ".atom", "config.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return cfg, nil

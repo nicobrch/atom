@@ -12,12 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nicobrch/rivet/internal/agent"
+	"github.com/nicobrch/atom/internal/agent"
 )
 
 // OpenAICompatible implements the streaming Chat Completions protocol. Keeping
 // this adapter wire-compatible makes the provider seam useful for OpenAI,
-// Copilot, and private gateways without pulling an SDK into Rivet.
+// Copilot, and private gateways without pulling an SDK into Atom.
 type OpenAICompatible struct {
 	ProviderName string
 	BaseURL      string
@@ -40,7 +40,7 @@ func OpenAIFromEnv() (*OpenAICompatible, error) {
 
 // OpenAIKey first honors the explicit API-key environment variable. When it is
 // absent, it reuses the API-style credential created by Codex's supported
-// "Sign in with ChatGPT" flow. Rivet never copies that credential or writes it
+// "Sign in with ChatGPT" flow. Atom never copies that credential or writes it
 // to a project file; it is read only for the request being made.
 func OpenAIKey() (string, error) {
 	if token := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); token != "" {
@@ -57,7 +57,7 @@ func OpenAIKey() (string, error) {
 	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("OpenAI credentials not found: set OPENAI_API_KEY or run `rivet auth openai`")
+			return "", fmt.Errorf("OpenAI credentials not found: set OPENAI_API_KEY or run `atom auth openai`")
 		}
 		return "", fmt.Errorf("read Codex credentials: %w", err)
 	}
@@ -87,7 +87,7 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 	}
 	return &OpenAICompatible{
 		ProviderName: "copilot", BaseURL: base, Token: token,
-		Headers: map[string]string{"Editor-Plugin-Version": "rivet/0.1", "Openai-Intent": "conversation-edits"},
+		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1", "Openai-Intent": "conversation-edits"},
 	}, nil
 }
 

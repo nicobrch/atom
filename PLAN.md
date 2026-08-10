@@ -1,4 +1,4 @@
-# Rivet plan
+# Atom plan
 
 ## 0.1 — usable tiny harness (implemented)
 

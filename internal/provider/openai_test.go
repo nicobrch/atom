@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nicobrch/rivet/internal/agent"
+	"github.com/nicobrch/atom/internal/agent"
 )
 
 func TestOpenAICompatibleStreamsTextAndTools(t *testing.T) {

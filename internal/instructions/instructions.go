@@ -32,9 +32,9 @@ func LoadAgents(workdir string) (string, []string, error) {
 }
 
 func DiscoverSkills(workdir string) ([]Skill, error) {
-	paths := []string{filepath.Join(workdir, ".rivet", "skills")}
+	paths := []string{filepath.Join(workdir, ".atom", "skills")}
 	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".rivet", "skills"))
+		paths = append(paths, filepath.Join(home, ".atom", "skills"))
 	}
 	var out []Skill
 	seen := map[string]bool{}

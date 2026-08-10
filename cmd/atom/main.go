@@ -13,12 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nicobrch/rivet/internal/agent"
-	"github.com/nicobrch/rivet/internal/config"
-	"github.com/nicobrch/rivet/internal/instructions"
-	"github.com/nicobrch/rivet/internal/provider"
-	"github.com/nicobrch/rivet/internal/session"
-	"github.com/nicobrch/rivet/internal/tool"
+	"github.com/nicobrch/atom/internal/agent"
+	"github.com/nicobrch/atom/internal/config"
+	"github.com/nicobrch/atom/internal/instructions"
+	"github.com/nicobrch/atom/internal/provider"
+	"github.com/nicobrch/atom/internal/session"
+	"github.com/nicobrch/atom/internal/tool"
 )
 
 const version = "0.1.0"
@@ -71,7 +71,7 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "print version")
 	flag.Parse()
 	if showVersion {
-		fmt.Println("rivet", version)
+		fmt.Println("atom", version)
 		return
 	}
 	if prompt == "" && flag.NArg() > 0 {
@@ -141,7 +141,7 @@ func main() {
 		}
 		return
 	}
-	fmt.Printf("\033[1mRivet %s\033[0m  %s/%s  %s\n", version, p.Name(), cfg.Model, wd)
+	fmt.Printf("\033[1mAtom %s\033[0m  %s/%s  %s\n", version, p.Name(), cfg.Model, wd)
 	if len(agentFiles) > 0 {
 		fmt.Printf("\033[2mLoaded %d AGENTS.md file(s); session %s\033[0m\n", len(agentFiles), store.Path())
 	}
@@ -150,7 +150,7 @@ func main() {
 
 func runAuth(args []string) {
 	if len(args) != 1 || args[0] != "openai" {
-		fatal("usage: rivet auth openai")
+		fatal("usage: atom auth openai")
 	}
 	cmd := exec.Command("codex", "--login")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -158,9 +158,9 @@ func runAuth(args []string) {
 		fatal("Codex sign-in failed: " + err.Error())
 	}
 	if _, err := provider.OpenAIKey(); err != nil {
-		fatal("Codex sign-in completed, but Rivet cannot use its credential: " + err.Error())
+		fatal("Codex sign-in completed, but Atom cannot use its credential: " + err.Error())
 	}
-	fmt.Println("OpenAI credential available to Rivet.")
+	fmt.Println("OpenAI credential available to Atom.")
 }
 
 func selectProvider(name string) (agent.Provider, error) {
@@ -260,6 +260,6 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 }
 
 func basePrompt(wd string) string {
-	return fmt.Sprintf(`You are Rivet, a careful terminal coding agent. Work in %s. Use tools to inspect before changing files. Keep changes scoped, run relevant tests, and report what changed. Never claim a command succeeded unless its output confirms it. Respect all AGENTS.md instructions.`, wd)
+	return fmt.Sprintf(`You are Atom, a careful terminal coding agent. Work in %s. Use tools to inspect before changing files. Keep changes scoped, run relevant tests, and report what changed. Never claim a command succeeded unless its output confirms it. Respect all AGENTS.md instructions.`, wd)
 }
-func fatal(s string) { fmt.Fprintln(os.Stderr, "rivet:", s); os.Exit(1) }
+func fatal(s string) { fmt.Fprintln(os.Stderr, "atom:", s); os.Exit(1) }

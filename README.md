@@ -1,6 +1,6 @@
-# Rivet
+# Atom
 
-Rivet is a tiny, dependency-free Go harness for coding agents. It starts as a
+Atom is a tiny, dependency-free Go harness for coding agents. It starts as a
 single binary, keeps sessions in readable JSONL, and deliberately has a small
 surface area:
 
@@ -13,12 +13,12 @@ surface area:
 ## Install and run
 
 ```bash
-go install github.com/nicobrch/rivet/cmd/rivet@latest
+go install github.com/nicobrch/atom/cmd/atom@latest
 export OPENAI_API_KEY=...
-rivet
+atom
 ```
 
-When developing from a checkout, use `go install ./cmd/rivet` instead.
+When developing from a checkout, use `go install ./cmd/atom` instead.
 
 ### Installing from the private repository
 
@@ -29,7 +29,7 @@ a one-time setup on each development machine:
 ```bash
 go env -w GOPRIVATE=github.com/nicobrch/*
 git config --global url."git@github.com:".insteadOf https://github.com/
-go install github.com/nicobrch/rivet/cmd/rivet@latest
+go install github.com/nicobrch/atom/cmd/atom@latest
 ```
 
 Alternatively, make the repository public and only the final `go install`
@@ -38,20 +38,20 @@ command is needed.
 OpenAI defaults to `gpt-5.4`; override it with `--model`.
 
 ```bash
-rivet --model gpt-5.4
-rivet -p "explain this repository"
+atom --model gpt-5.4
+atom -p "explain this repository"
 ```
 
 ### ChatGPT subscription / Codex sign-in
 
-Rivet also reuses the credential created by the supported Codex **Sign in with
+Atom also reuses the credential created by the supported Codex **Sign in with
 ChatGPT** flow. It reads `~/.codex/auth.json` only in memory; it never copies
-the credential into the repository or a Rivet session. Sign in once, then run
-Rivet normally without `OPENAI_API_KEY`:
+the credential into the repository or an Atom session. Sign in once, then run
+Atom normally without `OPENAI_API_KEY`:
 
 ```bash
-rivet auth openai
-rivet --model gpt-5.4
+atom auth openai
+atom --model gpt-5.4
 ```
 
 This delegates browser authentication to the installed Codex CLI. If you do
@@ -64,7 +64,7 @@ and, when necessary, its API endpoint:
 export COPILOT_TOKEN=...
 # optional; this is the normal individual endpoint
 export COPILOT_BASE_URL=https://api.individual.githubcopilot.com
-rivet --provider copilot --model gpt-5.4
+atom --provider copilot --model gpt-5.4
 ```
 
 `COPILOT_GITHUB_TOKEN` is accepted as an alias for `COPILOT_TOKEN`. OAuth/device
@@ -73,7 +73,7 @@ with the GitHub tooling you already use.
 
 ## Interaction
 
-Run `rivet` without `-p` to enter the terminal UI. Commands are:
+Run `atom` without `-p` to enter the terminal UI. Commands are:
 
 - `/help` — show commands
 - `/compact` — replace conversation history with a model-generated handoff
@@ -83,16 +83,16 @@ Run `rivet` without `-p` to enter the terminal UI. Commands are:
 - `/exit` — quit
 
 Every user, assistant, tool-call, tool-result, and compaction event is appended
-to `.rivet/sessions/<timestamp>.jsonl`. Resume one with `--session PATH`.
+to `.atom/sessions/<timestamp>.jsonl`. Resume one with `--session PATH`.
 
 ## Project customization
 
-Rivet loads every `AGENTS.md` from the workspace root down to the working
-directory. Put a skill in either `.rivet/skills/<name>/SKILL.md` or
-`~/.rivet/skills/<name>/SKILL.md`; the agent sees each skill's name and
+Atom loads every `AGENTS.md` from the workspace root down to the working
+directory. Put a skill in either `.atom/skills/<name>/SKILL.md` or
+`~/.atom/skills/<name>/SKILL.md`; the agent sees each skill's name and
 description. A user can explicitly load one with `/skill <name>`.
 
-The optional `.rivet/config.json` can provide defaults:
+The optional `.atom/config.json` can provide defaults:
 
 ```json
 {
@@ -123,7 +123,7 @@ path to OAuth, a richer optional Bubble Tea UI, MCP, and plugins.
 
 ## Safety boundary
 
-Rivet's built-in file tools are constrained to its starting workspace. `bash`
+Atom's built-in file tools are constrained to its starting workspace. `bash`
 runs in that workspace, has a time limit, but otherwise has the permissions of
-the Rivet process. Use a container, a restricted user, or a future approval
+the Atom process. Use a container, a restricted user, or a future approval
 policy when working in a sensitive repository.

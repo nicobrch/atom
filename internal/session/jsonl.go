@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/nicobrch/rivet/internal/agent"
+	"github.com/nicobrch/atom/internal/agent"
 )
 
 type Record struct {
@@ -23,7 +23,7 @@ type JSONL struct {
 }
 
 func New(workdir string) (*JSONL, error) {
-	dir := filepath.Join(workdir, ".rivet", "sessions")
+	dir := filepath.Join(workdir, ".atom", "sessions")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}

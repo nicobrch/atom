@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nicobrch/rivet/internal/agent"
+	"github.com/nicobrch/atom/internal/agent"
 )
 
 type Registry struct {
