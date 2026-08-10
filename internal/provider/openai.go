@@ -24,9 +24,21 @@ type OpenAICompatible struct {
 	Token        string
 	Headers      map[string]string
 	Client       *http.Client
+	Responses    bool
+	AccountID    string
 }
 
 func OpenAIFromEnv() (*OpenAICompatible, error) {
+	saved, err := loadAuth()
+	if err != nil {
+		return nil, err
+	}
+	if saved.OpenAIAPIKey != "" {
+		return &OpenAICompatible{ProviderName: "openai", BaseURL: "https://api.openai.com/v1", Token: saved.OpenAIAPIKey}, nil
+	}
+	if subscription, err := codexSubscription(); err == nil {
+		return subscription, nil
+	}
 	token, err := OpenAIKey()
 	if err != nil {
 		return nil, err
@@ -36,6 +48,35 @@ func OpenAIFromEnv() (*OpenAICompatible, error) {
 		base = "https://api.openai.com/v1"
 	}
 	return &OpenAICompatible{ProviderName: "openai", BaseURL: base, Token: token}, nil
+}
+
+func codexSubscription() (*OpenAICompatible, error) {
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		home = filepath.Join(userHome, ".codex")
+	}
+	b, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	if err != nil {
+		return nil, err
+	}
+	var auth struct {
+		AuthMode string `json:"auth_mode"`
+		Tokens   struct {
+			AccessToken string `json:"access_token"`
+			AccountID   string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(b, &auth); err != nil {
+		return nil, err
+	}
+	if auth.AuthMode != "chatgpt" || strings.TrimSpace(auth.Tokens.AccessToken) == "" {
+		return nil, fmt.Errorf("Codex ChatGPT subscription not found")
+	}
+	return &OpenAICompatible{ProviderName: "openai", BaseURL: codexResponsesURL, Token: auth.Tokens.AccessToken, AccountID: auth.Tokens.AccountID, Responses: true}, nil
 }
 
 // OpenAIKey first honors the explicit API-key environment variable. When it is
@@ -74,16 +115,23 @@ func OpenAIKey() (string, error) {
 }
 
 func CopilotFromEnv() (*OpenAICompatible, error) {
-	token := os.Getenv("COPILOT_TOKEN")
+	saved, err := loadAuth()
+	if err != nil {
+		return nil, err
+	}
+	token := saved.CopilotToken
+	if token == "" {
+		token = os.Getenv("COPILOT_TOKEN")
+	}
 	if token == "" {
 		token = os.Getenv("COPILOT_GITHUB_TOKEN")
 	}
 	if token == "" {
-		return nil, fmt.Errorf("COPILOT_TOKEN (or COPILOT_GITHUB_TOKEN) is not set")
+		return nil, fmt.Errorf("Copilot credentials not found: run `/login copilot` or `atom login copilot subscription`")
 	}
 	base := os.Getenv("COPILOT_BASE_URL")
 	if base == "" {
-		base = "https://api.individual.githubcopilot.com"
+		base = "https://api.githubcopilot.com"
 	}
 	return &OpenAICompatible{
 		ProviderName: "copilot", BaseURL: base, Token: token,
@@ -130,6 +178,9 @@ type toolFunction struct {
 }
 
 func (p *OpenAICompatible) Stream(ctx context.Context, req agent.Request) (<-chan agent.StreamEvent, <-chan error) {
+	if p.Responses {
+		return p.streamResponses(ctx, req)
+	}
 	events := make(chan agent.StreamEvent)
 	errs := make(chan error, 1)
 	go func() {
@@ -217,19 +268,9 @@ type chatChunk struct {
 }
 
 func parseSSE(r io.Reader, out chan<- agent.StreamEvent) error {
-	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for s.Scan() {
-		line := s.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			return nil
-		}
+	return parseSSELines(r, func(data []byte) error {
 		var chunk chatChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		if err := json.Unmarshal(data, &chunk); err != nil {
 			return fmt.Errorf("decode provider event: %w", err)
 		}
 		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
@@ -245,6 +286,25 @@ func parseSSE(r io.Reader, out chan<- agent.StreamEvent) error {
 			if c.FinishReason != "" {
 				out <- agent.StreamEvent{FinishReason: c.FinishReason}
 			}
+		}
+		return nil
+	})
+}
+
+func parseSSELines(r io.Reader, handle func([]byte) error) error {
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for s.Scan() {
+		line := s.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			return nil
+		}
+		if err := handle([]byte(data)); err != nil {
+			return err
 		}
 	}
 	return s.Err()

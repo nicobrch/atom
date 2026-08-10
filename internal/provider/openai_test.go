@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -11,6 +12,25 @@ import (
 
 	"github.com/nicobrch/atom/internal/agent"
 )
+
+func TestResponsesSSEStreamsTextAndTools(t *testing.T) {
+	input := "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"call_id\":\"call-1\",\"name\":\"read\"}}\n" +
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n"
+	out := make(chan agent.StreamEvent, 4)
+	if err := parseResponsesSSE(bytes.NewBufferString(input), out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+	var events []agent.StreamEvent
+	for e := range out {
+		events = append(events, e)
+	}
+	if len(events) != 4 || events[0].ToolCallDelta.Name != "read" || events[1].ToolCallDelta.Arguments != "{}" || events[2].TextDelta != "done" || events[3].InputTokens != 3 {
+		t.Fatalf("unexpected events: %#v", events)
+	}
+}
 
 func TestOpenAICompatibleStreamsTextAndTools(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

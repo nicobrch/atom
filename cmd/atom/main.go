@@ -57,8 +57,8 @@ func (t *terminal) Status(s string) {
 }
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "auth" {
-		runAuth(os.Args[2:])
+	if len(os.Args) >= 2 && (os.Args[1] == "auth" || os.Args[1] == "login") {
+		runLogin(os.Args[2:])
 		return
 	}
 	var providerName, model, prompt, sessionPath string
@@ -96,7 +96,10 @@ func main() {
 	}
 	p, err := selectProvider(cfg.Provider)
 	if err != nil {
-		fatal(err.Error())
+		if prompt != "" {
+			fatal(err.Error())
+		}
+		p = unavailableProvider{err}
 	}
 	agentsText, agentFiles, err := instructions.LoadAgents(wd)
 	if err != nil {
@@ -148,19 +151,55 @@ func main() {
 	runInteractive(ctx, loop, skills, store.Path(), cfg)
 }
 
-func runAuth(args []string) {
-	if len(args) != 1 || args[0] != "openai" {
-		fatal("usage: atom auth openai")
+func runLogin(args []string) {
+	if len(args) < 1 || len(args) > 2 {
+		fatal("usage: atom login <openai|copilot> [subscription|api]")
 	}
-	cmd := exec.Command("codex", "--login")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		fatal("Codex sign-in failed: " + err.Error())
+	name := args[0]
+	method := "subscription"
+	if len(args) == 2 {
+		method = args[1]
 	}
-	if _, err := provider.OpenAIKey(); err != nil {
-		fatal("Codex sign-in completed, but Atom cannot use its credential: " + err.Error())
+	if method == "api" {
+		fmt.Fprint(os.Stderr, "API key: ")
+		key, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && len(key) == 0 {
+			fatal(err.Error())
+		}
+		if err := provider.SaveAPIKey(name, key); err != nil {
+			fatal(err.Error())
+		}
+		fmt.Println("Credential saved for Atom.")
+		return
 	}
-	fmt.Println("OpenAI credential available to Atom.")
+	if method != "subscription" {
+		fatal("login method must be subscription or api")
+	}
+	switch name {
+	case "openai":
+		cmd := exec.Command("codex", "login")
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			fatal("Codex sign-in failed: " + err.Error())
+		}
+		p, err := provider.OpenAIFromEnv()
+		if err != nil || !p.Responses {
+			fatal("Codex sign-in completed, but Atom cannot use ChatGPT subscription credentials")
+		}
+		fmt.Println("ChatGPT subscription available to Atom.")
+	case "copilot", "github-copilot":
+		code, err := provider.StartCopilotLogin()
+		if err != nil {
+			fatal(err.Error())
+		}
+		fmt.Printf("Open %s and enter code %s. Waiting for authorization…\n", code.VerificationURI, code.UserCode)
+		if err := provider.FinishCopilotLogin(code); err != nil {
+			fatal(err.Error())
+		}
+		fmt.Println("GitHub Copilot subscription available to Atom.")
+	default:
+		fatal("usage: atom login <openai|copilot> [subscription|api]")
+	}
 }
 
 func selectProvider(name string) (agent.Provider, error) {
@@ -185,6 +224,17 @@ func toolsAsInterface(r *tool.Registry) []agent.Tool { // registry deliberately 
 type registryTool struct {
 	r *tool.Registry
 	d agent.ToolDefinition
+}
+
+type unavailableProvider struct{ err error }
+
+func (p unavailableProvider) Name() string { return "not logged in" }
+func (p unavailableProvider) Stream(context.Context, agent.Request) (<-chan agent.StreamEvent, <-chan error) {
+	events, errs := make(chan agent.StreamEvent), make(chan error, 1)
+	close(events)
+	errs <- p.err
+	close(errs)
+	return events, errs
 }
 
 func (t registryTool) Definition() agent.ToolDefinition { return t.d }
@@ -216,7 +266,7 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 		case line == "/exit" || line == "/quit":
 			return
 		case line == "/help":
-			fmt.Println("/compact  /clear  /session  /skills  /skill <name>  /exit")
+			fmt.Println("/login <openai|copilot> [subscription|api]  /compact  /clear  /session  /skills  /skill <name>  /exit")
 			continue
 		case line == "/session":
 			fmt.Println(sessionPath)
@@ -244,6 +294,56 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 		case line == "/clear":
 			loop.Messages = nil
 			fmt.Println("conversation cleared")
+			continue
+		case strings.HasPrefix(line, "/login"):
+			parts := strings.Fields(line)
+			if len(parts) < 2 || len(parts) > 3 {
+				fmt.Fprintln(os.Stderr, "usage: /login <openai|copilot> [subscription|api]")
+				continue
+			}
+			if len(parts) == 3 && parts[2] == "api" {
+				fmt.Print("API key: ")
+				if !s.Scan() {
+					return
+				}
+				if err := provider.SaveAPIKey(parts[1], s.Text()); err != nil {
+					fmt.Fprintln(os.Stderr, "error:", err)
+					continue
+				}
+			} else if len(parts) == 2 || parts[2] == "subscription" {
+				if parts[1] == "openai" {
+					cmd := exec.Command("codex", "login")
+					cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+					if err := cmd.Run(); err != nil {
+						fmt.Fprintln(os.Stderr, "error:", err)
+						continue
+					}
+				} else if parts[1] == "copilot" || parts[1] == "github-copilot" {
+					code, err := provider.StartCopilotLogin()
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error:", err)
+						continue
+					}
+					fmt.Printf("Open %s and enter code %s. Waiting for authorization…\n", code.VerificationURI, code.UserCode)
+					if err := provider.FinishCopilotLogin(code); err != nil {
+						fmt.Fprintln(os.Stderr, "error:", err)
+						continue
+					}
+				} else {
+					fmt.Fprintln(os.Stderr, "unknown provider")
+					continue
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "login method must be subscription or api")
+				continue
+			}
+			p, err := selectProvider(parts[1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				continue
+			}
+			loop.Provider = p
+			fmt.Printf("logged in with %s\n", p.Name())
 			continue
 		}
 		if loop.ApproxTokens() > int(float64(cfg.ContextTokens)*cfg.AutoCompactAt) {
