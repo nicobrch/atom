@@ -13,6 +13,9 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
+
 	"github.com/nicobrch/atom/internal/agent"
 	"github.com/nicobrch/atom/internal/config"
 	"github.com/nicobrch/atom/internal/instructions"
@@ -172,34 +175,41 @@ func runLogin(args []string) {
 		fmt.Println("Credential saved for Atom.")
 		return
 	}
+	if err := loginSubscription(name, method); err != nil {
+		fatal(err.Error())
+	}
+}
+
+func loginSubscription(name, method string) error {
 	if method != "subscription" {
-		fatal("login method must be subscription or api")
+		return fmt.Errorf("login method must be subscription or api")
 	}
 	switch name {
 	case "openai":
 		cmd := exec.Command("codex", "login")
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
-			fatal("Codex sign-in failed: " + err.Error())
+			return fmt.Errorf("Codex sign-in failed: %w", err)
 		}
 		p, err := provider.OpenAIFromEnv()
 		if err != nil || !p.Responses {
-			fatal("Codex sign-in completed, but Atom cannot use ChatGPT subscription credentials")
+			return fmt.Errorf("Codex sign-in completed, but Atom cannot use ChatGPT subscription credentials")
 		}
 		fmt.Println("ChatGPT subscription available to Atom.")
 	case "copilot", "github-copilot":
 		code, err := provider.StartCopilotLogin()
 		if err != nil {
-			fatal(err.Error())
+			return err
 		}
 		fmt.Printf("Open %s and enter code %s. Waiting for authorization…\n", code.VerificationURI, code.UserCode)
 		if err := provider.FinishCopilotLogin(code); err != nil {
-			fatal(err.Error())
+			return err
 		}
 		fmt.Println("GitHub Copilot subscription available to Atom.")
 	default:
-		fatal("usage: atom login <openai|copilot> [subscription|api]")
+		return fmt.Errorf("usage: atom login <openai|copilot> [subscription|api]")
 	}
+	return nil
 }
 
 func selectProvider(name string) (agent.Provider, error) {
@@ -249,16 +259,171 @@ func (p *plain) ToolStart(agent.ToolCall)                    {}
 func (p *plain) ToolEnd(_ agent.ToolCall, _ string, _ error) {}
 func (p *plain) Status(string)                               {}
 
-func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config) {
-	s := bufio.NewScanner(os.Stdin)
-	s.Buffer(make([]byte, 64*1024), 2*1024*1024)
-	for {
+var commands = []string{
+	"/clear", "/compact", "/exit", "/help", "/login <openai|copilot> [subscription|api]",
+	"/model <id>", "/models", "/session", "/skill <name>", "/skills",
+}
+
+func commandName(command string) string { return strings.Fields(command)[0] }
+
+func commandMatches(line string) []string {
+	if !strings.HasPrefix(line, "/") || strings.ContainsAny(line, " \t") {
+		return nil
+	}
+	var out []string
+	for _, command := range commands {
+		if strings.HasPrefix(command, line) {
+			out = append(out, command)
+		}
+	}
+	return out
+}
+
+type promptModel struct {
+	value    string
+	selected int
+	done     bool
+}
+
+func (m promptModel) Init() tea.Cmd { return nil }
+func (m promptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	matches := commandMatches(m.value)
+	switch k.String() {
+	case "ctrl+c", "esc":
+		m.done = true
+		m.value = ""
+		return m, tea.Quit
+	case "enter":
+		if len(matches) > 0 {
+			m.value = commandName(matches[m.selected])
+		}
+		m.done = true
+		return m, tea.Quit
+	case "up":
+		if len(matches) > 0 {
+			m.selected = (m.selected + len(matches) - 1) % len(matches)
+		}
+	case "down":
+		if len(matches) > 0 {
+			m.selected = (m.selected + 1) % len(matches)
+		}
+	case "backspace":
+		runes := []rune(m.value)
+		if len(runes) > 0 {
+			m.value = string(runes[:len(runes)-1])
+		}
+	default:
+		if len(k.Runes) > 0 {
+			m.value += string(k.Runes)
+		}
+	}
+	return m, nil
+}
+func (m promptModel) View() string {
+	if m.done {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\033[32m› \033[0m%s", m.value)
+	for i, command := range commandMatches(m.value) {
+		if i == m.selected {
+			fmt.Fprintf(&b, "\n\033[7m › %s \033[0m", command)
+		} else {
+			fmt.Fprintf(&b, "\n\033[2m   %s\033[0m", command)
+		}
+	}
+	return b.String()
+}
+
+func readPrompt() (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Print("\033[32m› \033[0m")
-		if !s.Scan() {
+		return bufio.NewReader(os.Stdin).ReadString('\n')
+	}
+	final, err := tea.NewProgram(promptModel{}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout)).Run()
+	if err != nil {
+		return "", err
+	}
+	return final.(promptModel).value, nil
+}
+
+type choiceModel struct {
+	title    string
+	options  []string
+	selected int
+	done     bool
+}
+
+func (m choiceModel) Init() tea.Cmd { return nil }
+func (m choiceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch k.String() {
+	case "ctrl+c", "esc":
+		m.done, m.selected = true, -1
+		return m, tea.Quit
+	case "enter":
+		m.done = true
+		return m, tea.Quit
+	case "up":
+		m.selected = (m.selected + len(m.options) - 1) % len(m.options)
+	case "down":
+		m.selected = (m.selected + 1) % len(m.options)
+	}
+	return m, nil
+}
+func (m choiceModel) View() string {
+	if m.done {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\033[1m%s\033[0m  \033[2m(↑/↓, Enter)\033[0m", m.title)
+	for i, option := range m.options {
+		if i == m.selected {
+			fmt.Fprintf(&b, "\n\033[7m › %s \033[0m", option)
+		} else {
+			fmt.Fprintf(&b, "\n   %s", option)
+		}
+	}
+	return b.String()
+}
+
+func choose(label string, options []string) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("%s requires an interactive terminal", label)
+	}
+	final, err := tea.NewProgram(choiceModel{title: label, options: options}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout)).Run()
+	if err != nil {
+		return "", err
+	}
+	m := final.(choiceModel)
+	if m.selected < 0 {
+		return "", io.EOF
+	}
+	return m.options[m.selected], nil
+}
+
+func readSecret() (string, error) {
+	fmt.Print("API key: ")
+	key, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	return strings.TrimSpace(string(key)), err
+}
+
+func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config) {
+	for {
+		raw, err := readPrompt()
+		if err != nil {
 			fmt.Println()
 			return
 		}
-		line := strings.TrimSpace(s.Text())
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
@@ -266,7 +431,21 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 		case line == "/exit" || line == "/quit":
 			return
 		case line == "/help":
-			fmt.Println("/login <openai|copilot> [subscription|api]  /compact  /clear  /session  /skills  /skill <name>  /exit")
+			fmt.Println(strings.Join(commands, "  "))
+			continue
+		case line == "/models":
+			fmt.Printf("current: %s\nuse: /model <id>\n", loop.Model)
+			continue
+		case strings.HasPrefix(line, "/model "):
+			loop.Model = strings.TrimSpace(strings.TrimPrefix(line, "/model "))
+			if loop.Model == "" {
+				fmt.Fprintln(os.Stderr, "usage: /model <id>")
+			} else {
+				fmt.Println("model", loop.Model)
+			}
+			continue
+		case line == "/model":
+			fmt.Printf("current: %s\nuse: /model <id>\n", loop.Model)
 			continue
 		case line == "/session":
 			fmt.Println(sessionPath)
@@ -297,47 +476,43 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 			continue
 		case strings.HasPrefix(line, "/login"):
 			parts := strings.Fields(line)
-			if len(parts) < 2 || len(parts) > 3 {
+			if len(parts) > 3 {
 				fmt.Fprintln(os.Stderr, "usage: /login <openai|copilot> [subscription|api]")
 				continue
 			}
-			if len(parts) == 3 && parts[2] == "api" {
-				fmt.Print("API key: ")
-				if !s.Scan() {
-					return
+			name := ""
+			if len(parts) > 1 {
+				name = parts[1]
+			} else {
+				name, err = choose("Login provider  (↑/↓, Enter)", []string{"openai", "copilot"})
+				if err != nil {
+					continue
 				}
-				if err := provider.SaveAPIKey(parts[1], s.Text()); err != nil {
+			}
+			method := ""
+			if len(parts) > 2 {
+				method = parts[2]
+			} else {
+				method, err = choose("Login method  (↑/↓, Enter)", []string{"subscription", "api"})
+				if err != nil {
+					continue
+				}
+			}
+			if method == "api" {
+				key, err := readSecret()
+				if err != nil {
 					fmt.Fprintln(os.Stderr, "error:", err)
 					continue
 				}
-			} else if len(parts) == 2 || parts[2] == "subscription" {
-				if parts[1] == "openai" {
-					cmd := exec.Command("codex", "login")
-					cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-					if err := cmd.Run(); err != nil {
-						fmt.Fprintln(os.Stderr, "error:", err)
-						continue
-					}
-				} else if parts[1] == "copilot" || parts[1] == "github-copilot" {
-					code, err := provider.StartCopilotLogin()
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error:", err)
-						continue
-					}
-					fmt.Printf("Open %s and enter code %s. Waiting for authorization…\n", code.VerificationURI, code.UserCode)
-					if err := provider.FinishCopilotLogin(code); err != nil {
-						fmt.Fprintln(os.Stderr, "error:", err)
-						continue
-					}
-				} else {
-					fmt.Fprintln(os.Stderr, "unknown provider")
+				if err := provider.SaveAPIKey(name, key); err != nil {
+					fmt.Fprintln(os.Stderr, "error:", err)
 					continue
 				}
-			} else {
-				fmt.Fprintln(os.Stderr, "login method must be subscription or api")
+			} else if err := loginSubscription(name, method); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
 				continue
 			}
-			p, err := selectProvider(parts[1])
+			p, err := selectProvider(name)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "error:", err)
 				continue
