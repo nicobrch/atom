@@ -24,7 +24,7 @@ import (
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 type terminal struct {
 	out           io.Writer
@@ -630,6 +630,7 @@ type loginDone struct {
 	provider string
 	err      error
 }
+type thinkingTick struct{}
 
 type uiObserver struct{ events chan<- tea.Msg }
 
@@ -668,6 +669,9 @@ type appModel struct {
 	loginProvider string
 	models        []provider.Model
 	assistantOpen bool
+	scroll        int
+	thinking      bool
+	thinkingFrame int
 }
 
 func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config, wd string, agentFiles int) {
@@ -677,7 +681,7 @@ func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, 
 	if agentFiles > 0 {
 		m.transcript = append(m.transcript, fmt.Sprintf("Loaded %d AGENTS.md file(s)", agentFiles))
 	}
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "atom:", err)
 	}
 }
@@ -698,12 +702,34 @@ func (m appModel) loadModels() tea.Cmd {
 		return modelsLoaded{models: models, err: err}
 	}
 }
-func (m *appModel) add(line string) { m.transcript = append(m.transcript, line) }
+func (m *appModel) add(line string) {
+	m.transcript = append(m.transcript, line)
+}
+func (m *appModel) clampScroll() {
+	max := m.height - 6
+	if m.thinking {
+		max--
+	}
+	if max < 3 {
+		max = 3
+	}
+	limit := len(wrappedTranscript(m.transcript, m.width-2)) - max
+	if limit < 0 {
+		limit = 0
+	}
+	if m.scroll > limit {
+		m.scroll = limit
+	}
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+}
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case uiText:
+		m.thinking = false
 		if !m.assistantOpen {
 			m.add(string(msg))
 			m.assistantOpen = true
@@ -713,19 +739,29 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitEvent(m.events)
 	case uiStatus:
 		if msg == "thinking" {
-			m.add("· thinking")
+			m.thinking = true
+			m.thinkingFrame = 0
 			m.assistantOpen = false
+			return m, tea.Batch(waitEvent(m.events), nextThinkingTick())
 		}
 		return m, waitEvent(m.events)
 	case uiTool:
+		m.thinking = false
 		if msg.name != "" {
 			m.add("└─ " + msg.name)
 		} else if msg.output != "" && len(m.transcript) > 0 {
 			m.transcript[len(m.transcript)-1] += "  " + msg.output
 		}
 		return m, waitEvent(m.events)
+	case thinkingTick:
+		if m.thinking {
+			m.thinkingFrame = (m.thinkingFrame + 1) % 4
+			return m, nextThinkingTick()
+		}
+		return m, nil
 	case turnDone:
 		m.busy = false
+		m.thinking = false
 		if msg.err != nil {
 			m.add("error: " + msg.err.Error())
 		}
@@ -797,6 +833,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.menuKey(msg)
 		}
 		return m.inputKey(msg)
+	case tea.MouseMsg:
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			m.scroll += 3
+		case tea.MouseWheelDown:
+			m.scroll -= 3
+			if m.scroll < 0 {
+				m.scroll = 0
+			}
+		}
+		m.clampScroll()
 	}
 	return m, nil
 }
@@ -851,15 +898,35 @@ func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "ctrl+c":
 		return m, tea.Quit
-	case "up", "down":
+	case "up", "down", "ctrl+p", "ctrl+n":
 		matches := commandMatches(m.input)
 		if len(matches) > 0 {
-			if k.String() == "up" {
+			if k.String() == "up" || k.String() == "ctrl+p" {
 				m.selected = (m.selected + len(matches) - 1) % len(matches)
 			} else {
 				m.selected = (m.selected + 1) % len(matches)
 			}
+		} else if m.input == "" {
+			if k.String() == "up" || k.String() == "ctrl+p" {
+				m.scroll++
+			} else if m.scroll > 0 {
+				m.scroll--
+			}
+			m.clampScroll()
 		}
+	case "pgup", "ctrl+u":
+		m.scroll += m.height / 2
+		m.clampScroll()
+	case "pgdown", "ctrl+d":
+		m.scroll -= m.height / 2
+		if m.scroll < 0 {
+			m.scroll = 0
+		}
+	case "home":
+		m.scroll = 1 << 30
+		m.clampScroll()
+	case "end":
+		m.scroll = 0
 	case "backspace":
 		r := []rune(m.input)
 		if len(r) > 0 {
@@ -922,6 +989,7 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.add("› " + line)
+		m.scroll = 0
 		if m.busy {
 			m.queue = append(m.queue, line)
 			m.add(fmt.Sprintf("queued (%d)", len(m.queue)))
@@ -939,15 +1007,44 @@ func (m appModel) View() string {
 		width = 20
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\033[1mAtom %s\033[0m  \033[36m%s/%s\033[0m\n", version, m.loop.Provider.Name(), m.loop.Model)
+	header := fmt.Sprintf("\033[1mAtom %s\033[0m  \033[36m%s/%s\033[0m", version, m.loop.Provider.Name(), m.loop.Model)
+	if m.loop.ReasoningEffort != "" {
+		header += "  \033[36m· " + m.loop.ReasoningEffort + "\033[0m"
+	}
+	fmt.Fprintln(&b, header)
 	fmt.Fprintf(&b, "\033[2m%s  ·  %s\033[0m\n", m.wd, authSource(m.loop.Provider))
-	lines := m.transcript
-	max := m.height - 7
+	lines := wrappedTranscript(m.transcript, width)
+	max := m.height - 6
 	if max < 3 {
 		max = 3
 	}
-	if len(lines) > max {
-		lines = lines[len(lines)-max:]
+	if m.thinking {
+		max--
+	}
+	if (m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models") || len(commandMatches(m.input)) > 0 {
+		max--
+	}
+	if max < 3 {
+		max = 3
+	}
+	maxScroll := len(lines) - max
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scroll > maxScroll {
+		m.scroll = maxScroll
+	}
+	start := len(lines) - max - m.scroll
+	if start < 0 {
+		start = 0
+	}
+	end := start + max
+	if end > len(lines) {
+		end = len(lines)
+	}
+	lines = lines[start:end]
+	if m.scroll > 0 && len(lines) > 0 {
+		lines[0] = "↑ " + lines[0]
 	}
 	for _, line := range lines {
 		if strings.HasPrefix(line, "·") || strings.HasPrefix(line, "└") || strings.HasPrefix(line, "queued") || strings.HasPrefix(line, "model set:") || strings.HasPrefix(line, "Loaded ") {
@@ -960,6 +1057,9 @@ func (m appModel) View() string {
 	}
 	for i := len(lines); i < max; i++ {
 		b.WriteByte('\n')
+	}
+	if m.thinking {
+		fmt.Fprintf(&b, "\033[2m· thinking%s\033[0m\n", strings.Repeat(".", m.thinkingFrame+1))
 	}
 	if m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models" {
 		fmt.Fprintf(&b, "\033[1m%s\033[0m\n", m.menuTitle)
@@ -993,8 +1093,38 @@ func (m appModel) View() string {
 	if len(m.queue) > 0 {
 		state += fmt.Sprintf("  ·  queued %d", len(m.queue))
 	}
-	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m  \033[2m%s  / commands\033[0m", strings.Repeat("─", width-2), state)
+	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m  \033[2m%s  ↑↓/PgUp/PgDn/scroll  / commands\033[0m", strings.Repeat("─", width-2), state)
 	return b.String()
+}
+
+func nextThinkingTick() tea.Cmd {
+	return tea.Tick(350*time.Millisecond, func(time.Time) tea.Msg { return thinkingTick{} })
+}
+
+func wrappedTranscript(entries []string, width int) []string {
+	var out []string
+	for _, entry := range entries {
+		for _, line := range strings.Split(entry, "\n") {
+			runes := []rune(line)
+			if len(runes) == 0 {
+				out = append(out, "")
+				continue
+			}
+			for len(runes) > width {
+				cut := width
+				for cut > width/2 && runes[cut] != ' ' {
+					cut--
+				}
+				if cut == width/2 {
+					cut = width
+				}
+				out = append(out, string(runes[:cut]))
+				runes = []rune(strings.TrimSpace(string(runes[cut:])))
+			}
+			out = append(out, string(runes))
+		}
+	}
+	return out
 }
 
 func authSource(p agent.Provider) string {
