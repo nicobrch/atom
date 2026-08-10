@@ -27,17 +27,24 @@ import (
 const version = "0.1.0"
 
 type terminal struct {
-	out      io.Writer
-	lineOpen bool
+	out           io.Writer
+	assistantOpen bool
+	toolLineOpen  bool
 }
 
-func (t *terminal) Text(s string) { fmt.Fprint(t.out, s); t.lineOpen = true }
-func (t *terminal) ToolStart(c agent.ToolCall) {
-	if t.lineOpen {
-		fmt.Fprintln(t.out)
-		t.lineOpen = false
+func (t *terminal) Text(s string) {
+	if !t.assistantOpen {
+		fmt.Fprint(t.out, "\033[1mAtom\033[0m  ")
+		t.assistantOpen = true
 	}
-	fmt.Fprintf(t.out, "\033[36m• %s\033[0m ", c.Name)
+	fmt.Fprint(t.out, s)
+}
+func (t *terminal) ToolStart(c agent.ToolCall) {
+	if t.assistantOpen || t.toolLineOpen {
+		fmt.Fprintln(t.out)
+	}
+	fmt.Fprintf(t.out, "\033[2m└─\033[0m \033[36m%s\033[0m ", c.Name)
+	t.assistantOpen, t.toolLineOpen = false, true
 }
 func (t *terminal) ToolEnd(_ agent.ToolCall, output string, err error) {
 	label := "done"
@@ -49,14 +56,18 @@ func (t *terminal) ToolEnd(_ agent.ToolCall, output string, err error) {
 		one = one[:140] + "…"
 	}
 	fmt.Fprintf(t.out, "\033[2m%s: %s\033[0m\n", label, one)
+	t.toolLineOpen = false
 }
 func (t *terminal) Status(s string) {
 	if s == "thinking" {
-		fmt.Fprint(t.out, "\033[2m… \033[0m")
+		fmt.Fprint(t.out, "\n\033[2m• thinking\033[0m\n")
+		t.assistantOpen, t.toolLineOpen = false, false
 	} else if s == "done" {
-		fmt.Fprintln(t.out)
+		if t.assistantOpen || t.toolLineOpen {
+			fmt.Fprintln(t.out)
+		}
+		fmt.Fprintln(t.out, "\033[2m────────────────────────────────────────────────────────\033[0m")
 	}
-	t.lineOpen = false
 }
 
 func main() {
@@ -132,7 +143,7 @@ func main() {
 	} else {
 		obs = &terminal{out: os.Stdout}
 	}
-	loop := &agent.Loop{Provider: p, Model: cfg.Model, Tools: toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second)), System: system, Sink: store, Observer: obs}
+	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second)), System: system, Sink: store, Observer: obs}
 	if sessionPath != "" {
 		messages, e := session.LoadMessages(sessionPath)
 		if e != nil {
@@ -147,11 +158,7 @@ func main() {
 		}
 		return
 	}
-	fmt.Printf("\033[1mAtom %s\033[0m  %s/%s  %s\n", version, p.Name(), cfg.Model, wd)
-	if len(agentFiles) > 0 {
-		fmt.Printf("\033[2mLoaded %d AGENTS.md file(s); session %s\033[0m\n", len(agentFiles), store.Path())
-	}
-	runInteractive(ctx, loop, skills, store.Path(), cfg)
+	runApp(ctx, loop, skills, store.Path(), cfg, wd, len(agentFiles))
 }
 
 func runLogin(args []string) {
@@ -261,7 +268,7 @@ func (p *plain) Status(string)                               {}
 
 var commands = []string{
 	"/clear", "/compact", "/exit", "/help", "/login <openai|copilot> [subscription|api]",
-	"/model <id>", "/models", "/session", "/skill <name>", "/skills",
+	"/effort", "/model <id>", "/models", "/session", "/skill <name>", "/skills",
 }
 
 func commandName(command string) string { return strings.Fields(command)[0] }
@@ -416,7 +423,55 @@ func readSecret() (string, error) {
 	return strings.TrimSpace(string(key)), err
 }
 
-func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config) {
+type modelLister interface {
+	Models(context.Context) ([]provider.Model, error)
+}
+
+func availableModels(ctx context.Context, p agent.Provider) ([]provider.Model, error) {
+	lister, ok := p.(modelLister)
+	if !ok {
+		return nil, fmt.Errorf("%s does not provide a model catalog", p.Name())
+	}
+	return lister.Models(ctx)
+}
+
+func printBanner(p agent.Provider, model, wd string) {
+	text := fmt.Sprintf("\033[1mAtom %s\033[0m  %s/%s  %s", version, p.Name(), model, wd)
+	fmt.Printf("\033]0;Atom %s/%s\a%s\n", p.Name(), model, text)
+}
+
+func refreshBanner(p agent.Provider, model, wd string) {
+	// Bubble Tea owns its frame. Clearing after its picker exits avoids stale
+	// frames while preserving terminal scrollback.
+	fmt.Print("\033[2J\033[H")
+	printBanner(p, model, wd)
+}
+
+func updateBanner(p agent.Provider, model, wd string, atTop bool) {
+	if atTop {
+		refreshBanner(p, model, wd)
+	} else {
+		fmt.Printf("model: %s/%s\n", p.Name(), model)
+	}
+}
+
+func setModel(ctx context.Context, loop *agent.Loop, id, wd string, bannerAtTop bool) error {
+	models, err := availableModels(ctx, loop.Provider)
+	if err != nil {
+		return err
+	}
+	for _, model := range models {
+		if model.ID == id {
+			loop.Model = id
+			updateBanner(loop.Provider, loop.Model, wd, bannerAtTop)
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q is not available for %s; use /model", id, loop.Provider.Name())
+}
+
+func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config, wd string) {
+	bannerAtTop := true
 	for {
 		raw, err := readPrompt()
 		if err != nil {
@@ -434,18 +489,44 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 			fmt.Println(strings.Join(commands, "  "))
 			continue
 		case line == "/models":
-			fmt.Printf("current: %s\nuse: /model <id>\n", loop.Model)
+			models, err := availableModels(ctx, loop.Provider)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				continue
+			}
+			for _, model := range models {
+				marker := " "
+				if model.ID == loop.Model {
+					marker = "*"
+				}
+				if model.Name != "" && model.Name != model.ID {
+					fmt.Printf("%s %s — %s\n", marker, model.ID, model.Name)
+				} else {
+					fmt.Printf("%s %s\n", marker, model.ID)
+				}
+			}
 			continue
 		case strings.HasPrefix(line, "/model "):
-			loop.Model = strings.TrimSpace(strings.TrimPrefix(line, "/model "))
-			if loop.Model == "" {
-				fmt.Fprintln(os.Stderr, "usage: /model <id>")
-			} else {
-				fmt.Println("model", loop.Model)
+			if err := setModel(ctx, loop, strings.TrimSpace(strings.TrimPrefix(line, "/model ")), wd, bannerAtTop); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
 			}
 			continue
 		case line == "/model":
-			fmt.Printf("current: %s\nuse: /model <id>\n", loop.Model)
+			models, err := availableModels(ctx, loop.Provider)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				continue
+			}
+			options := make([]string, len(models))
+			for i, model := range models {
+				options[i] = model.ID
+			}
+			id, err := choose("Select model", options)
+			if err == nil {
+				if err := setModel(ctx, loop, id, wd, bannerAtTop); err != nil {
+					fmt.Fprintln(os.Stderr, "error:", err)
+				}
+			}
 			continue
 		case line == "/session":
 			fmt.Println(sessionPath)
@@ -519,6 +600,7 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 			}
 			loop.Provider = p
 			fmt.Printf("logged in with %s\n", p.Name())
+			updateBanner(loop.Provider, loop.Model, wd, bannerAtTop)
 			continue
 		}
 		if loop.ApproxTokens() > int(float64(cfg.ContextTokens)*cfg.AutoCompactAt) {
@@ -528,10 +610,401 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 				continue
 			}
 		}
+		fmt.Printf("\n\033[7m › %s \033[0m\n", line)
+		bannerAtTop = false
 		if err := loop.Prompt(ctx, line); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}
 	}
+}
+
+type uiText string
+type uiStatus string
+type uiTool struct{ name, output string }
+type turnDone struct{ err error }
+type modelsLoaded struct {
+	models []provider.Model
+	err    error
+}
+type loginDone struct {
+	provider string
+	err      error
+}
+
+type uiObserver struct{ events chan<- tea.Msg }
+
+func (o uiObserver) Text(s string)              { o.events <- uiText(s) }
+func (o uiObserver) Status(s string)            { o.events <- uiStatus(s) }
+func (o uiObserver) ToolStart(c agent.ToolCall) { o.events <- uiTool{name: c.Name} }
+func (o uiObserver) ToolEnd(_ agent.ToolCall, out string, err error) {
+	if err != nil {
+		out = "error: " + err.Error()
+	}
+	one := strings.ReplaceAll(strings.TrimSpace(out), "\n", " ")
+	if len(one) > 140 {
+		one = one[:140] + "…"
+	}
+	o.events <- uiTool{output: one}
+}
+
+type appModel struct {
+	ctx           context.Context
+	loop          *agent.Loop
+	skills        []instructions.Skill
+	sessionPath   string
+	cfg           config.Config
+	wd            string
+	events        chan tea.Msg
+	input         string
+	transcript    []string
+	queue         []string
+	busy          bool
+	width         int
+	height        int
+	selected      int
+	menu          []string
+	menuTitle     string
+	menuKind      string
+	loginProvider string
+	models        []provider.Model
+	assistantOpen bool
+}
+
+func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config, wd string, agentFiles int) {
+	events := make(chan tea.Msg, 64)
+	loop.Observer = uiObserver{events: events}
+	m := appModel{ctx: ctx, loop: loop, skills: skills, sessionPath: sessionPath, cfg: cfg, wd: wd, events: events, width: 100, height: 30}
+	if agentFiles > 0 {
+		m.transcript = append(m.transcript, fmt.Sprintf("Loaded %d AGENTS.md file(s)", agentFiles))
+	}
+	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "atom:", err)
+	}
+}
+
+func (m appModel) Init() tea.Cmd { return waitEvent(m.events) }
+func waitEvent(events <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg { return <-events }
+}
+func (m appModel) startTurn(text string) tea.Cmd {
+	return func() tea.Msg {
+		err := m.loop.Prompt(m.ctx, text)
+		return turnDone{err: err}
+	}
+}
+func (m appModel) loadModels() tea.Cmd {
+	return func() tea.Msg {
+		models, err := availableModels(m.ctx, m.loop.Provider)
+		return modelsLoaded{models: models, err: err}
+	}
+}
+func (m *appModel) add(line string) { m.transcript = append(m.transcript, line) }
+func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+	case uiText:
+		if !m.assistantOpen {
+			m.add(string(msg))
+			m.assistantOpen = true
+		} else {
+			m.transcript[len(m.transcript)-1] += string(msg)
+		}
+		return m, waitEvent(m.events)
+	case uiStatus:
+		if msg == "thinking" {
+			m.add("· thinking")
+			m.assistantOpen = false
+		}
+		return m, waitEvent(m.events)
+	case uiTool:
+		if msg.name != "" {
+			m.add("└─ " + msg.name)
+		} else if msg.output != "" && len(m.transcript) > 0 {
+			m.transcript[len(m.transcript)-1] += "  " + msg.output
+		}
+		return m, waitEvent(m.events)
+	case turnDone:
+		m.busy = false
+		if msg.err != nil {
+			m.add("error: " + msg.err.Error())
+		}
+		if len(m.queue) > 0 {
+			next := m.queue[0]
+			m.queue = m.queue[1:]
+			m.busy = true
+			m.add("› " + next)
+			return m, m.startTurn(next)
+		}
+		return m, nil
+	case modelsLoaded:
+		if msg.err != nil {
+			m.add("error: " + msg.err.Error())
+			return m, nil
+		}
+		m.models = msg.models
+		if m.menuKind == "models" {
+			for _, model := range m.models {
+				mark := " "
+				if model.ID == m.loop.Model {
+					mark = "*"
+				}
+				m.add(fmt.Sprintf("%s %s", mark, model.ID))
+			}
+			m.menuKind = ""
+			return m, nil
+		}
+		if m.menuKind == "effort-loading" {
+			for _, model := range m.models {
+				if model.ID == m.loop.Model {
+					m.menu = model.Efforts
+					break
+				}
+			}
+			if len(m.menu) == 0 {
+				m.add("selected model does not expose effort controls")
+				m.menuKind = ""
+				return m, nil
+			}
+			m.menuTitle, m.menuKind, m.selected = "Select effort", "effort", 0
+			return m, nil
+		}
+		m.menuTitle, m.menuKind, m.selected = "Select model", "model", 0
+		m.menu = make([]string, len(m.models))
+		for i, model := range m.models {
+			m.menu[i] = model.ID
+		}
+		return m, nil
+	case loginDone:
+		if msg.err != nil {
+			m.add("login failed: " + msg.err.Error())
+			return m, nil
+		}
+		p, err := selectProvider(msg.provider)
+		if err != nil {
+			m.add("login failed: " + err.Error())
+			return m, nil
+		}
+		m.loop.Provider, m.cfg.Provider = p, msg.provider
+		if err := config.Save(m.wd, m.cfg); err != nil {
+			m.add("error saving settings: " + err.Error())
+		} else {
+			m.add("logged in: " + authSource(p))
+		}
+		return m, nil
+	case tea.KeyMsg:
+		if m.menuKind != "" && m.menuKind != "models" {
+			return m.menuKey(msg)
+		}
+		return m.inputKey(msg)
+	}
+	return m, nil
+}
+
+func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "esc":
+		m.menuKind, m.menu = "", nil
+	case "up":
+		m.selected = (m.selected + len(m.menu) - 1) % len(m.menu)
+	case "down":
+		m.selected = (m.selected + 1) % len(m.menu)
+	case "enter":
+		id := m.menu[m.selected]
+		if m.menuKind == "login-provider" {
+			m.loginProvider = id
+			m.menuTitle, m.menuKind, m.menu, m.selected = "Login method", "login-method", []string{"subscription", "api"}, 0
+			return m, nil
+		}
+		if m.menuKind == "login-method" {
+			m.menuKind, m.menu = "", nil
+			cmd := exec.Command(os.Args[0], "login", m.loginProvider, id)
+			return m, tea.ExecProcess(cmd, func(err error) tea.Msg { return loginDone{provider: m.loginProvider, err: err} })
+		}
+		if m.menuKind == "effort" {
+			m.loop.ReasoningEffort, m.cfg.Effort = id, id
+			m.menuKind, m.menu = "", nil
+			if err := config.Save(m.wd, m.cfg); err != nil {
+				m.add("error saving settings: " + err.Error())
+			} else {
+				m.add("effort set: " + id)
+			}
+			return m, nil
+		}
+		m.menuKind, m.menu = "", nil
+		for _, model := range m.models {
+			if model.ID == id {
+				m.loop.Model, m.cfg.Model = id, id
+				if err := config.Save(m.wd, m.cfg); err != nil {
+					m.add("error saving settings: " + err.Error())
+				} else {
+					m.add("model set: " + id)
+				}
+				break
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up", "down":
+		matches := commandMatches(m.input)
+		if len(matches) > 0 {
+			if k.String() == "up" {
+				m.selected = (m.selected + len(matches) - 1) % len(matches)
+			} else {
+				m.selected = (m.selected + 1) % len(matches)
+			}
+		}
+	case "backspace":
+		r := []rune(m.input)
+		if len(r) > 0 {
+			m.input = string(r[:len(r)-1])
+		}
+	case "enter":
+		line := strings.TrimSpace(m.input)
+		if matches := commandMatches(line); len(matches) > 0 {
+			line = commandName(matches[m.selected%len(matches)])
+		}
+		m.input, m.selected = "", 0
+		return m.submit(line)
+	default:
+		if len(k.Runes) > 0 {
+			m.input += string(k.Runes)
+		}
+	}
+	return m, nil
+}
+
+func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
+	if line == "" {
+		return m, nil
+	}
+	switch line {
+	case "/exit", "/quit":
+		return m, tea.Quit
+	case "/clear":
+		m.loop.Messages, m.transcript = nil, nil
+	case "/help":
+		m.add(strings.Join(commands, "  "))
+	case "/session":
+		m.add(m.sessionPath)
+	case "/models":
+		m.menuKind = "models"
+		return m, m.loadModels()
+	case "/model":
+		if m.busy {
+			m.add("wait for current turn before changing model")
+			return m, nil
+		}
+		m.menuKind = "loading"
+		return m, m.loadModels()
+	case "/effort":
+		if m.busy {
+			m.add("wait for current turn before changing effort")
+			return m, nil
+		}
+		m.menuKind, m.menu = "effort-loading", nil
+		return m, m.loadModels()
+	case "/login":
+		if m.busy {
+			m.add("wait for current turn before changing login")
+			return m, nil
+		}
+		m.menuTitle, m.menuKind, m.menu, m.selected = "Login provider", "login-provider", []string{"openai", "copilot"}, 0
+	default:
+		if strings.HasPrefix(line, "/") {
+			m.add("unsupported here: " + line)
+			return m, nil
+		}
+		m.add("› " + line)
+		if m.busy {
+			m.queue = append(m.queue, line)
+			m.add(fmt.Sprintf("queued (%d)", len(m.queue)))
+			return m, nil
+		}
+		m.busy = true
+		return m, m.startTurn(line)
+	}
+	return m, nil
+}
+
+func (m appModel) View() string {
+	width := m.width - 2
+	if width < 20 {
+		width = 20
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\033[1mAtom %s\033[0m  \033[36m%s/%s\033[0m\n", version, m.loop.Provider.Name(), m.loop.Model)
+	fmt.Fprintf(&b, "\033[2m%s  ·  %s\033[0m\n", m.wd, authSource(m.loop.Provider))
+	lines := m.transcript
+	max := m.height - 7
+	if max < 3 {
+		max = 3
+	}
+	if len(lines) > max {
+		lines = lines[len(lines)-max:]
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "·") || strings.HasPrefix(line, "└") || strings.HasPrefix(line, "queued") || strings.HasPrefix(line, "model set:") || strings.HasPrefix(line, "Loaded ") {
+			fmt.Fprintf(&b, "\033[2m%s\033[0m\n", line)
+		} else if strings.HasPrefix(line, "› ") {
+			fmt.Fprintf(&b, "\033[36m%s\033[0m\n", line)
+		} else {
+			fmt.Fprintf(&b, "\033[97m%s\033[0m\n", line)
+		}
+	}
+	for i := len(lines); i < max; i++ {
+		b.WriteByte('\n')
+	}
+	if m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models" {
+		fmt.Fprintf(&b, "\033[1m%s\033[0m\n", m.menuTitle)
+		for i, item := range m.menu {
+			if i == m.selected {
+				fmt.Fprintf(&b, "\033[7m › %s \033[0m ", item)
+			} else {
+				fmt.Fprintf(&b, "   %s ", item)
+			}
+		}
+		b.WriteByte('\n')
+	} else if matches := commandMatches(m.input); len(matches) > 0 {
+		for i, item := range matches {
+			if i == m.selected%len(matches) {
+				fmt.Fprintf(&b, "\033[7m › %s \033[0m ", item)
+			} else {
+				fmt.Fprintf(&b, "\033[2m   %s\033[0m ", item)
+			}
+		}
+		b.WriteByte('\n')
+	}
+	fmt.Fprintf(&b, "\033[36m┌%s┐\033[0m\n", strings.Repeat("─", width-2))
+	fmt.Fprintf(&b, "\033[36m│\033[0m › %s\n", m.input)
+	state := fmt.Sprintf("%s  ·  %s", m.loop.Provider.Name(), m.loop.Model)
+	if m.loop.ReasoningEffort != "" {
+		state += "  ·  " + m.loop.ReasoningEffort
+	}
+	if m.busy {
+		state += "  ·  working"
+	}
+	if len(m.queue) > 0 {
+		state += fmt.Sprintf("  ·  queued %d", len(m.queue))
+	}
+	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m  \033[2m%s  / commands\033[0m", strings.Repeat("─", width-2), state)
+	return b.String()
+}
+
+func authSource(p agent.Provider) string {
+	if openai, ok := p.(*provider.OpenAICompatible); ok && openai.Responses {
+		return "ChatGPT subscription"
+	}
+	if p.Name() == "copilot" {
+		return "GitHub Copilot"
+	}
+	return "OpenAI API key"
 }
 
 func basePrompt(wd string) string {

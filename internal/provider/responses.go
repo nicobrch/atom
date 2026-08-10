@@ -38,7 +38,11 @@ func (p *OpenAICompatible) streamResponses(ctx context.Context, req agent.Reques
 		for _, t := range req.Tools {
 			tools = append(tools, map[string]any{"type": "function", "name": t.Name, "description": t.Description, "parameters": t.Parameters})
 		}
-		body, err := json.Marshal(map[string]any{"model": req.Model, "instructions": req.System, "input": input, "tools": tools, "stream": true, "store": false})
+		payload := map[string]any{"model": req.Model, "instructions": req.System, "input": input, "tools": tools, "stream": true, "store": false}
+		if req.ReasoningEffort != "" {
+			payload["reasoning"] = map[string]string{"effort": req.ReasoningEffort}
+		}
+		body, err := json.Marshal(payload)
 		if err != nil {
 			errs <- err
 			return

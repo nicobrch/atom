@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -67,5 +68,46 @@ func TestOpenAIKeyReadsCodexCredentialWhenEnvIsUnset(t *testing.T) {
 	key, err := OpenAIKey()
 	if err != nil || key != "from-codex" {
 		t.Fatalf("key=%q err=%v", key, err)
+	}
+}
+
+func TestCopilotModelsUsesPickerAndChatCapabilities(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" || r.Header.Get("Authorization") != "Bearer test" {
+			t.Fatalf("unexpected request: %s %q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		fmt.Fprint(w, `{"data":[
+			{"id":"enabled","name":"Enabled","model_picker_enabled":true,"supported_endpoints":["/chat/completions"]},
+			{"id":"messages-only","model_picker_enabled":true,"supported_endpoints":["/v1/messages"]},
+			{"id":"hidden","model_picker_enabled":false,"supported_endpoints":["/chat/completions"]}
+		]}`)
+	}))
+	defer s.Close()
+	models, err := (&OpenAICompatible{ProviderName: "copilot", BaseURL: s.URL, Token: "test"}).Models(context.Background())
+	if err != nil || len(models) != 1 || models[0].ID != "enabled" {
+		t.Fatalf("models=%#v err=%v", models, err)
+	}
+}
+
+func TestResponsesSendsSelectedEffort(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Reasoning struct {
+				Effort string `json:"effort"`
+			} `json:"reasoning"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Reasoning.Effort != "high" {
+			t.Fatalf("effort=%q err=%v", body.Reasoning.Effort, err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer s.Close()
+	p := &OpenAICompatible{BaseURL: s.URL, Token: "test", Responses: true}
+	events, errs := p.Stream(context.Background(), agent.Request{Model: "test", ReasoningEffort: "high"})
+	for range events {
+	}
+	if err := <-errs; err != nil {
+		t.Fatal(err)
 	}
 }

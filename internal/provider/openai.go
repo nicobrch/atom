@@ -9,8 +9,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/nicobrch/atom/internal/agent"
 )
@@ -26,6 +29,125 @@ type OpenAICompatible struct {
 	Client       *http.Client
 	Responses    bool
 	AccountID    string
+}
+
+type Model struct {
+	ID            string
+	Name          string
+	Efforts       []string
+	DefaultEffort string
+}
+
+// Models returns models granted to this exact credential. ChatGPT accounts use
+// Codex's own account-aware catalog; API and Copilot credentials ask their API.
+func (p *OpenAICompatible) Models(ctx context.Context) ([]Model, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if p.Responses {
+		return codexModels(ctx)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.BaseURL, "/")+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.Token)
+	for k, v := range p.Headers {
+		req.Header.Set(k, v)
+	}
+	client := p.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return nil, fmt.Errorf("list models: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var data struct {
+		Data []struct {
+			ID                 string   `json:"id"`
+			Name               string   `json:"name"`
+			ModelPickerEnabled bool     `json:"model_picker_enabled"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+			Policy             struct {
+				State string `json:"state"`
+			} `json:"policy"`
+			Capabilities struct {
+				Supports struct {
+					ReasoningEffort []string `json:"reasoning_effort"`
+				} `json:"supports"`
+			} `json:"capabilities"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("decode models: %w", err)
+	}
+	models := make([]Model, 0, len(data.Data))
+	for _, item := range data.Data {
+		if item.ID == "" || item.Policy.State == "disabled" {
+			continue
+		}
+		if p.ProviderName == "copilot" && (!item.ModelPickerEnabled || (len(item.SupportedEndpoints) > 0 && !contains(item.SupportedEndpoints, "/chat/completions"))) {
+			continue
+		}
+		models = append(models, Model{ID: item.ID, Name: item.Name, Efforts: item.Capabilities.Supports.ReasoningEffort})
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	if len(models) == 0 {
+		return nil, fmt.Errorf("no selectable models available for %s", p.ProviderName)
+	}
+	return models, nil
+}
+
+func codexModels(ctx context.Context) ([]Model, error) {
+	output, err := exec.CommandContext(ctx, "codex", "debug", "models").Output()
+	if err != nil {
+		return nil, fmt.Errorf("read ChatGPT models with Codex: %w", err)
+	}
+	var catalog struct {
+		Models []struct {
+			Slug           string `json:"slug"`
+			DisplayName    string `json:"display_name"`
+			Visibility     string `json:"visibility"`
+			SupportedInAPI bool   `json:"supported_in_api"`
+			DefaultEffort  string `json:"default_reasoning_level"`
+			Efforts        []struct {
+				Effort string `json:"effort"`
+			} `json:"supported_reasoning_levels"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(output, &catalog); err != nil {
+		return nil, fmt.Errorf("decode ChatGPT models: %w", err)
+	}
+	models := make([]Model, 0, len(catalog.Models))
+	for _, item := range catalog.Models {
+		if item.Slug != "" && item.Visibility == "list" && item.SupportedInAPI {
+			efforts := make([]string, 0, len(item.Efforts))
+			for _, effort := range item.Efforts {
+				if effort.Effort != "" {
+					efforts = append(efforts, effort.Effort)
+				}
+			}
+			models = append(models, Model{ID: item.Slug, Name: item.DisplayName, Efforts: efforts, DefaultEffort: item.DefaultEffort})
+		}
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("no models available for this ChatGPT account")
+	}
+	return models, nil
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func OpenAIFromEnv() (*OpenAICompatible, error) {
@@ -142,12 +264,13 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 func (p *OpenAICompatible) Name() string { return p.ProviderName }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Tools       []chatTool    `json:"tools,omitempty"`
-	Stream      bool          `json:"stream"`
-	StreamOpts  streamOptions `json:"stream_options"`
-	Temperature *float64      `json:"temperature,omitempty"`
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	Tools           []chatTool    `json:"tools,omitempty"`
+	Stream          bool          `json:"stream"`
+	StreamOpts      streamOptions `json:"stream_options"`
+	Temperature     *float64      `json:"temperature,omitempty"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
 }
 type streamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
@@ -186,7 +309,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req agent.Request) (<-cha
 	go func() {
 		defer close(events)
 		defer close(errs)
-		payload := chatRequest{Model: req.Model, Stream: true, StreamOpts: streamOptions{IncludeUsage: true}, Temperature: req.Temperature}
+		payload := chatRequest{Model: req.Model, Stream: true, StreamOpts: streamOptions{IncludeUsage: true}, Temperature: req.Temperature, ReasoningEffort: req.ReasoningEffort}
 		if req.System != "" {
 			payload.Messages = append(payload.Messages, chatMessage{Role: "system", Content: req.System})
 		}

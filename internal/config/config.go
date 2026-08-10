@@ -10,6 +10,7 @@ import (
 type Config struct {
 	Provider           string  `json:"provider"`
 	Model              string  `json:"model"`
+	Effort             string  `json:"effort,omitempty"`
 	ContextTokens      int     `json:"context_tokens"`
 	AutoCompactAt      float64 `json:"auto_compact_at"`
 	BashTimeoutSeconds int     `json:"bash_timeout_seconds"`
@@ -48,4 +49,16 @@ func Load(workdir string) (Config, error) {
 		cfg.BashTimeoutSeconds = 120
 	}
 	return cfg, nil
+}
+
+func Save(workdir string, cfg Config) error {
+	path := filepath.Join(workdir, ".atom", "config.json")
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0644)
 }

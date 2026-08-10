@@ -27,11 +27,12 @@ type ToolDefinition struct {
 }
 
 type Request struct {
-	Model       string
-	System      string
-	Messages    []Message
-	Tools       []ToolDefinition
-	Temperature *float64
+	Model           string
+	System          string
+	Messages        []Message
+	Tools           []ToolDefinition
+	Temperature     *float64
+	ReasoningEffort string
 }
 
 // StreamEvent is intentionally small. Providers can report text and partial

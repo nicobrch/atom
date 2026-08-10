@@ -22,6 +22,7 @@ type Loop struct {
 	Sink                      EventSink
 	Observer                  Observer
 	InputTokens, OutputTokens int
+	ReasoningEffort           string
 }
 
 func (l *Loop) Prompt(ctx context.Context, text string) error {
@@ -43,7 +44,7 @@ func (l *Loop) run(ctx context.Context) error {
 		if l.Observer != nil {
 			l.Observer.Status("thinking")
 		}
-		events, errs := l.Provider.Stream(ctx, Request{Model: l.Model, System: l.System, Messages: l.Messages, Tools: defs})
+		events, errs := l.Provider.Stream(ctx, Request{Model: l.Model, System: l.System, Messages: l.Messages, Tools: defs, ReasoningEffort: l.ReasoningEffort})
 		var text strings.Builder
 		calls := map[int]*ToolCall{}
 		var order []int
