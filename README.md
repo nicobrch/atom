@@ -20,6 +20,21 @@ rivet
 
 When developing from a checkout, use `go install ./cmd/rivet` instead.
 
+### Installing from the private repository
+
+If the repository remains private, configure Go to skip the public module proxy
+for your GitHub namespace and make Git use your authenticated SSH key. This is
+a one-time setup on each development machine:
+
+```bash
+go env -w GOPRIVATE=github.com/nicobrch/*
+git config --global url."git@github.com:".insteadOf https://github.com/
+go install github.com/nicobrch/rivet/cmd/rivet@latest
+```
+
+Alternatively, make the repository public and only the final `go install`
+command is needed.
+
 OpenAI defaults to `gpt-5.4`; override it with `--model`.
 
 ```bash
