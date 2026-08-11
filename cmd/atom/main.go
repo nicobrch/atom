@@ -26,7 +26,7 @@ import (
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.1.3"
+const version = "0.1.4"
 const headerPadding = 1
 const composerPadding = 1
 
@@ -472,7 +472,14 @@ func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, 
 	}
 }
 
-func (m appModel) Init() tea.Cmd { return waitEvent(m.events) }
+func (m appModel) Init() tea.Cmd {
+	// Fetch the authenticated provider's catalog up front so the footer uses the
+	// selected model's actual context window, without opening the model picker.
+	if _, unavailable := m.loop.Provider.(unavailableProvider); !unavailable {
+		return tea.Batch(waitEvent(m.events), m.loadModels())
+	}
+	return waitEvent(m.events)
+}
 func waitEvent(events <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg { return <-events }
 }
@@ -979,7 +986,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case modelsLoaded:
 		if msg.err != nil {
-			m.add("error: " + msg.err.Error())
+			if m.menuKind != "" {
+				m.add("error: " + msg.err.Error())
+			}
 			return m, nil
 		}
 		m.models = msg.models
@@ -1009,10 +1018,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.menuTitle, m.menuKind, m.selected = "Select effort", "effort", 0
 			return m, nil
 		}
-		m.menuTitle, m.menuKind, m.selected = "Select model", "model", 0
-		m.menu = make([]string, len(m.models))
-		for i, model := range m.models {
-			m.menu[i] = model.ID
+		if m.menuKind == "loading" {
+			m.menuTitle, m.menuKind, m.selected = "Select model", "model", 0
+			m.menu = make([]string, len(m.models))
+			for i, model := range m.models {
+				m.menu[i] = model.ID
+			}
 		}
 		return m, nil
 	case loginDone:
@@ -1026,12 +1037,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loop.Provider, m.cfg.Provider = p, msg.provider
-		if err := config.Save(m.wd, m.cfg); err != nil {
-			m.add("error saving settings: " + err.Error())
-		} else {
-			m.add("logged in: " + authSource(p))
-		}
-		return m, nil
+		// A provider's model set is credential-specific. Always make the user
+		// choose one after login instead of inheriting a guessed default model.
+		m.loop.Model, m.cfg.Model = "", ""
+		m.add("logged in: " + authSource(p))
+		m.menuKind = "loading"
+		return m, m.loadModels()
 	case tea.KeyMsg:
 		if m.menuKind != "" && m.menuKind != "models" {
 			return m.menuKey(msg)
@@ -1443,6 +1454,14 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 			m.add("unsupported here: " + line)
 			return m, nil
 		}
+		if _, unavailable := m.loop.Provider.(unavailableProvider); unavailable {
+			m.add("sign in required — use /login before starting a conversation")
+			return m, nil
+		}
+		if m.loop.Model == "" {
+			m.add("select a model first with /model")
+			return m, nil
+		}
 		m.add("› " + line)
 		m.scroll = 0
 		if m.busy {
@@ -1547,7 +1566,7 @@ func (m appModel) View() string {
 		state += fmt.Sprintf("  ·  queued %d", len(m.queue))
 	}
 	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m\n", strings.Repeat("─", width-2))
-	left, gap, right := footerParts(state, contextStatus(m.loop, m.cfg.ContextTokens), width)
+	left, gap, right := footerParts(state, contextStatus(m.loop, m.contextTokenLimit()), width)
 	fmt.Fprintf(&b, "\033[36m%s\033[0m%s\033[2m%s\033[0m", left, gap, right)
 	return b.String()
 }
@@ -1638,14 +1657,26 @@ func shortenLabel(label string, width int) string {
 
 func contextStatus(loop *agent.Loop, limit int) string {
 	if limit < 1 {
-		limit = config.Defaults().ContextTokens
+		return fmt.Sprintf("ctx ~%s/unknown · processed %s", formatTokens(loop.ApproxTokens()), formatTokens(loop.InputTokens+loop.OutputTokens))
 	}
 	used := loop.ApproxTokens()
 	percent := used * 100 / limit
 	return fmt.Sprintf("ctx ~%s/%s (%d%%) · processed %s", formatTokens(used), formatTokens(limit), percent, formatTokens(loop.InputTokens+loop.OutputTokens))
 }
 
+func (m appModel) contextTokenLimit() int {
+	for _, model := range m.models {
+		if model.ID == m.loop.Model {
+			return model.ContextTokens
+		}
+	}
+	return 0
+}
+
 func formatTokens(n int) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%.1fm", float64(n)/1000000)
+	}
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
 	}
@@ -1944,6 +1975,9 @@ func wrappedTranscript(entries []string, width int) []string {
 }
 
 func authSource(p agent.Provider) string {
+	if _, unavailable := p.(unavailableProvider); unavailable {
+		return "Sign in required"
+	}
 	if openai, ok := p.(*provider.OpenAICompatible); ok && openai.Responses {
 		return "ChatGPT subscription"
 	}

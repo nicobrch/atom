@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-const copilotClientID = "Ov23li8tweQw6odWQebz"
+// copilotClientID belongs to Atom's GitHub OAuth app. It is public client
+// metadata, not a client secret; GitHub Device Flow only uses the client ID.
+const copilotClientID = "Ov23liymK8r0F637IA3P"
 
 type CopilotDeviceCode struct {
 	VerificationURI string `json:"verification_uri"`

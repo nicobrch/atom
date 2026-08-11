@@ -111,14 +111,14 @@ func TestCopilotModelsUsesPickerAndChatCapabilities(t *testing.T) {
 			t.Fatalf("unexpected request: %s %q", r.URL.Path, r.Header.Get("Authorization"))
 		}
 		fmt.Fprint(w, `{"data":[
-			{"id":"enabled","name":"Enabled","model_picker_enabled":true,"supported_endpoints":["/chat/completions"]},
+			{"id":"enabled","name":"Enabled","model_picker_enabled":true,"supported_endpoints":["/chat/completions"],"capabilities":{"limits":{"context_window":1000000}}},
 			{"id":"messages-only","model_picker_enabled":true,"supported_endpoints":["/v1/messages"]},
 			{"id":"hidden","model_picker_enabled":false,"supported_endpoints":["/chat/completions"]}
 		]}`)
 	}))
 	defer s.Close()
 	models, err := (&OpenAICompatible{ProviderName: "copilot", BaseURL: s.URL, Token: "test"}).Models(context.Background())
-	if err != nil || len(models) != 1 || models[0].ID != "enabled" {
+	if err != nil || len(models) != 1 || models[0].ID != "enabled" || models[0].ContextTokens != 1000000 {
 		t.Fatalf("models=%#v err=%v", models, err)
 	}
 }

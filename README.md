@@ -25,5 +25,12 @@ Use `~/.bashrc` instead of `~/.zshrc` when you use Bash. You can now run:
 atom
 ```
 
+Atom starts without a selected provider or model. Use `/login` in the app (or
+`atom login openai` / `atom login copilot`) and then select one of the models
+available to that account before starting a conversation.
+
+For GitHub Copilot device login, Atom uses Atom's own GitHub OAuth app; the
+GitHub consent page identifies the application as Atom.
+
 Inside Atom, run `/update` to pull the latest version and rebuild it. Restart
 Atom after the update completes.

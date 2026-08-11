@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+func TestDefaultsRequireLoginAndModelSelection(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Provider != "" || cfg.Model != "" {
+		t.Fatalf("new-install defaults must not select a provider or model: %#v", cfg)
+	}
+}
+
 func TestSavePersistsModel(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Defaults()

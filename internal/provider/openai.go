@@ -36,6 +36,7 @@ type Model struct {
 	Name          string
 	Efforts       []string
 	DefaultEffort string
+	ContextTokens int
 }
 
 // Models returns models granted to this exact credential. ChatGPT accounts use
@@ -80,7 +81,21 @@ func (p *OpenAICompatible) Models(ctx context.Context) ([]Model, error) {
 				Supports struct {
 					ReasoningEffort []string `json:"reasoning_effort"`
 				} `json:"supports"`
+				Limits struct {
+					ContextWindow          int `json:"context_window"`
+					ContextLength          int `json:"context_length"`
+					MaxContextTokens       int `json:"max_context_tokens"`
+					MaxContextLength       int `json:"max_context_length"`
+					ContextWindowTokens    int `json:"context_window_tokens"`
+					MaxContextWindowTokens int `json:"max_context_window_tokens"`
+				} `json:"limits"`
 			} `json:"capabilities"`
+			ContextWindow          int `json:"context_window"`
+			ContextLength          int `json:"context_length"`
+			MaxContextTokens       int `json:"max_context_tokens"`
+			MaxContextLength       int `json:"max_context_length"`
+			ContextWindowTokens    int `json:"context_window_tokens"`
+			MaxContextWindowTokens int `json:"max_context_window_tokens"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
@@ -94,7 +109,10 @@ func (p *OpenAICompatible) Models(ctx context.Context) ([]Model, error) {
 		if p.ProviderName == "copilot" && (!item.ModelPickerEnabled || (len(item.SupportedEndpoints) > 0 && !contains(item.SupportedEndpoints, "/chat/completions"))) {
 			continue
 		}
-		models = append(models, Model{ID: item.ID, Name: item.Name, Efforts: item.Capabilities.Supports.ReasoningEffort})
+		models = append(models, Model{ID: item.ID, Name: item.Name, Efforts: item.Capabilities.Supports.ReasoningEffort, ContextTokens: firstPositive(
+			item.ContextWindow, item.ContextLength, item.MaxContextTokens, item.MaxContextLength, item.ContextWindowTokens, item.MaxContextWindowTokens,
+			item.Capabilities.Limits.ContextWindow, item.Capabilities.Limits.ContextLength, item.Capabilities.Limits.MaxContextTokens, item.Capabilities.Limits.MaxContextLength, item.Capabilities.Limits.ContextWindowTokens, item.Capabilities.Limits.MaxContextWindowTokens,
+		)})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	if len(models) == 0 {
@@ -110,12 +128,15 @@ func codexModels(ctx context.Context) ([]Model, error) {
 	}
 	var catalog struct {
 		Models []struct {
-			Slug           string `json:"slug"`
-			DisplayName    string `json:"display_name"`
-			Visibility     string `json:"visibility"`
-			SupportedInAPI bool   `json:"supported_in_api"`
-			DefaultEffort  string `json:"default_reasoning_level"`
-			Efforts        []struct {
+			Slug             string `json:"slug"`
+			DisplayName      string `json:"display_name"`
+			Visibility       string `json:"visibility"`
+			SupportedInAPI   bool   `json:"supported_in_api"`
+			DefaultEffort    string `json:"default_reasoning_level"`
+			ContextWindow    int    `json:"context_window"`
+			ContextLength    int    `json:"context_length"`
+			MaxContextTokens int    `json:"max_context_tokens"`
+			Efforts          []struct {
 				Effort string `json:"effort"`
 			} `json:"supported_reasoning_levels"`
 		} `json:"models"`
@@ -132,13 +153,22 @@ func codexModels(ctx context.Context) ([]Model, error) {
 					efforts = append(efforts, effort.Effort)
 				}
 			}
-			models = append(models, Model{ID: item.Slug, Name: item.DisplayName, Efforts: efforts, DefaultEffort: item.DefaultEffort})
+			models = append(models, Model{ID: item.Slug, Name: item.DisplayName, Efforts: efforts, DefaultEffort: item.DefaultEffort, ContextTokens: firstPositive(item.ContextWindow, item.ContextLength, item.MaxContextTokens)})
 		}
 	}
 	if len(models) == 0 {
 		return nil, fmt.Errorf("no models available for this ChatGPT account")
 	}
 	return models, nil
+}
+
+func firstPositive(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func contains(values []string, want string) bool {
@@ -257,7 +287,7 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 	}
 	return &OpenAICompatible{
 		ProviderName: "copilot", BaseURL: base, Token: token,
-		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1.3", "Openai-Intent": "conversation-edits"},
+		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1.4", "Openai-Intent": "conversation-edits"},
 	}, nil
 }
 

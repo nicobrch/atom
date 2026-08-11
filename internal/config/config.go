@@ -11,7 +11,6 @@ type Config struct {
 	Provider                    string   `json:"provider"`
 	Model                       string   `json:"model"`
 	Effort                      string   `json:"effort,omitempty"`
-	ContextTokens               int      `json:"context_tokens"`
 	AutoCompactAt               float64  `json:"auto_compact_at"`
 	BashTimeoutSeconds          int      `json:"bash_timeout_seconds"`
 	ProjectDocFallbackFilenames []string `json:"project_doc_fallback_filenames,omitempty"`
@@ -19,7 +18,9 @@ type Config struct {
 }
 
 func Defaults() Config {
-	return Config{Provider: "openai", Model: "gpt-5.4", ContextTokens: 128000, AutoCompactAt: .80, BashTimeoutSeconds: 120, ProjectDocMaxBytes: 32 * 1024}
+	// A new installation deliberately has no provider or model. Atom must not
+	// assume either a credential or a model until the user has signed in.
+	return Config{AutoCompactAt: .80, BashTimeoutSeconds: 120, ProjectDocMaxBytes: 32 * 1024}
 }
 
 func Load(workdir string) (Config, error) {
@@ -55,9 +56,6 @@ func loadInto(cfg Config, path string) (Config, error) {
 	if overrides.Effort != nil {
 		cfg.Effort = *overrides.Effort
 	}
-	if overrides.ContextTokens != nil {
-		cfg.ContextTokens = *overrides.ContextTokens
-	}
 	if overrides.AutoCompactAt != nil {
 		cfg.AutoCompactAt = *overrides.AutoCompactAt
 	}
@@ -78,7 +76,6 @@ type configOverrides struct {
 	Provider                    *string   `json:"provider"`
 	Model                       *string   `json:"model"`
 	Effort                      *string   `json:"effort"`
-	ContextTokens               *int      `json:"context_tokens"`
 	AutoCompactAt               *float64  `json:"auto_compact_at"`
 	BashTimeoutSeconds          *int      `json:"bash_timeout_seconds"`
 	ProjectDocFallbackFilenames *[]string `json:"project_doc_fallback_filenames"`
@@ -87,15 +84,6 @@ type configOverrides struct {
 
 func normalize(cfg Config) Config {
 	defaults := Defaults()
-	if cfg.Provider == "" {
-		cfg.Provider = defaults.Provider
-	}
-	if cfg.Model == "" {
-		cfg.Model = defaults.Model
-	}
-	if cfg.ContextTokens <= 0 {
-		cfg.ContextTokens = defaults.ContextTokens
-	}
 	if cfg.AutoCompactAt <= 0 || cfg.AutoCompactAt >= 1 {
 		cfg.AutoCompactAt = defaults.AutoCompactAt
 	}

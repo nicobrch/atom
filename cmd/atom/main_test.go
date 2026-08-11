@@ -354,16 +354,36 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 		cfg:    config.Defaults(),
 	}
 	view := m.View()
-	versionIndex := strings.Index(view, "atom 0.1.3")
-	subscriptionIndex := strings.Index(view, "OpenAI API key")
+	versionIndex := strings.Index(view, "atom 0.1.4")
+	subscriptionIndex := strings.Index(view, "Sign in required")
 	if versionIndex < 0 || subscriptionIndex < 0 {
 		t.Fatalf("header metadata missing from view: %q", view[:100])
 	}
 	if strings.Count(view[:subscriptionIndex], "\n") <= strings.Count(view[:versionIndex], "\n") {
 		t.Fatalf("subscription should be below version")
 	}
-	if strings.Contains(view, "Atom 0.1.3") {
+	if strings.Contains(view, "Atom 0.1.4") {
 		t.Fatalf("version label should use lowercase atom")
+	}
+}
+
+func TestViewUsesSelectedModelsContextLimit(t *testing.T) {
+	m := appModel{
+		width: 100, height: 30,
+		loop:   &agent.Loop{Provider: unavailableProvider{}, Model: "large-context", Messages: []agent.Message{{Content: "hello"}}},
+		models: []provider.Model{{ID: "large-context", ContextTokens: 1000000}},
+	}
+	if !strings.Contains(m.View(), "ctx ~2/1.0m") {
+		t.Fatalf("view did not show model context window: %q", m.View())
+	}
+}
+
+func TestConversationRequiresLogin(t *testing.T) {
+	m := appModel{loop: &agent.Loop{Provider: unavailableProvider{}}}
+	got, cmd := m.submit("hello")
+	m = got.(appModel)
+	if cmd != nil || m.busy || len(m.transcript) != 1 || !strings.Contains(m.transcript[0], "sign in required") {
+		t.Fatalf("unavailable provider started a conversation: %#v", m)
 	}
 }
 
