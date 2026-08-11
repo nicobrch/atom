@@ -266,29 +266,8 @@ func OpenAIKey() (string, error) {
 	return "", fmt.Errorf("Codex is signed in but no reusable API credential is available; run `codex --login` again or set OPENAI_API_KEY")
 }
 
-func CopilotFromEnv() (*OpenAICompatible, error) {
-	saved, err := loadAuth()
-	if err != nil {
-		return nil, err
-	}
-	token := saved.CopilotToken
-	if token == "" {
-		token = os.Getenv("COPILOT_TOKEN")
-	}
-	if token == "" {
-		token = os.Getenv("COPILOT_GITHUB_TOKEN")
-	}
-	if token == "" {
-		return nil, fmt.Errorf("Copilot credentials not found: run `/login copilot` or `atom login copilot subscription`")
-	}
-	base := os.Getenv("COPILOT_BASE_URL")
-	if base == "" {
-		base = "https://api.githubcopilot.com"
-	}
-	return &OpenAICompatible{
-		ProviderName: "copilot", BaseURL: base, Token: token,
-		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1.4", "Openai-Intent": "conversation-edits"},
-	}, nil
+func CopilotFromEnv() (agent.Provider, error) {
+	return NewCopilotSDK(""), nil
 }
 
 func (p *OpenAICompatible) Name() string { return p.ProviderName }

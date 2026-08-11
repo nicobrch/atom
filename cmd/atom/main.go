@@ -175,6 +175,9 @@ func main() {
 	}
 	agentTools := toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second))
 	agentTools = append(agentTools, skillTool{skills: skills})
+	if p, ok := p.(interface{ SetTools([]agent.Tool) }); ok {
+		p.SetTools(agentTools)
+	}
 	sessionSink := &resumableSession{store: store}
 	defer sessionSink.Close()
 	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: agentTools, System: system, Sink: sessionSink, Diagnostics: logStore, Observer: obs}
@@ -238,15 +241,16 @@ func loginSubscription(name, method string) error {
 		}
 		fmt.Println("ChatGPT subscription available to Atom.")
 	case "copilot", "github-copilot":
-		code, err := provider.StartCopilotLogin()
+		path, err := provider.CopilotCLIPath()
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Open %s and enter code %s. Waiting for authorization…\n", code.VerificationURI, code.UserCode)
-		if err := provider.FinishCopilotLogin(code); err != nil {
-			return err
+		cmd := exec.Command(path, "login")
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("Copilot CLI sign-in failed: %w", err)
 		}
-		fmt.Println("GitHub Copilot subscription available to Atom.")
+		fmt.Println("GitHub Copilot CLI subscription available to Atom.")
 	default:
 		return fmt.Errorf("usage: atom login <openai|copilot> [subscription|api]")
 	}
@@ -1035,6 +1039,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.add("login failed: " + err.Error())
 			return m, nil
+		}
+		if p, ok := p.(interface{ SetTools([]agent.Tool) }); ok {
+			p.SetTools(m.loop.Tools)
 		}
 		m.loop.Provider, m.cfg.Provider = p, msg.provider
 		// A provider's model set is credential-specific. Always make the user

@@ -29,8 +29,9 @@ Atom starts without a selected provider or model. Use `/login` in the app (or
 `atom login openai` / `atom login copilot`) and then select one of the models
 available to that account before starting a conversation.
 
-For GitHub Copilot device login, Atom uses Atom's own GitHub OAuth app; the
-GitHub consent page identifies the application as Atom.
+GitHub Copilot uses GitHub's supported Copilot CLI transport, bundled into Atom
+release builds. Run `atom login copilot`; Atom opens Copilot's login flow and
+the CLI owns GitHub authentication and model access.
 
 Inside Atom, run `/update` to pull the latest version and rebuild it. Restart
 Atom after the update completes.

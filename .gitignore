@@ -19,3 +19,4 @@
 
 # Editor and operating-system local state.
 .DS_Store
+cmd/atom/zcopilot_*
