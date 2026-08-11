@@ -12,19 +12,35 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 
 	"github.com/nicobrch/atom/internal/agent"
 	"github.com/nicobrch/atom/internal/config"
+	"github.com/nicobrch/atom/internal/diagnostics"
 	"github.com/nicobrch/atom/internal/instructions"
 	"github.com/nicobrch/atom/internal/provider"
 	"github.com/nicobrch/atom/internal/session"
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
+const headerPadding = 1
+const composerPadding = 1
+
+var atomLogo = []string{
+	"       _                   ",
+	"  __ _| |_ ___  _ __ ___  ",
+	" / _` | __/ _ \\| '_ ` _ \\",
+	"| (_| | || (_) | | | | | |",
+	" \\__,_|\\__\\___/|_| |_| |_|",
+}
+
+var workingFrames = []string{
+	"", ".", "..", "...",
+}
 
 type terminal struct {
 	out           io.Writer
@@ -62,6 +78,8 @@ func (t *terminal) Status(s string) {
 	if s == "thinking" {
 		fmt.Fprint(t.out, "\n\033[2m• thinking\033[0m\n")
 		t.assistantOpen, t.toolLineOpen = false, false
+	} else if strings.HasPrefix(s, "retrying ") {
+		fmt.Fprintf(t.out, "\033[2m• %s\033[0m\n", s)
 	} else if s == "done" {
 		if t.assistantOpen || t.toolLineOpen {
 			fmt.Fprintln(t.out)
@@ -137,13 +155,18 @@ func main() {
 		fatal(err.Error())
 	}
 	defer store.Close()
+	logStore, err := diagnostics.New(wd)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer logStore.Close()
 	var obs agent.Observer
 	if printMode {
 		obs = &plain{out: os.Stdout}
 	} else {
 		obs = &terminal{out: os.Stdout}
 	}
-	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second)), System: system, Sink: store, Observer: obs}
+	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second)), System: system, Sink: store, Diagnostics: logStore, Observer: obs}
 	if sessionPath != "" {
 		messages, e := session.LoadMessages(sessionPath)
 		if e != nil {
@@ -158,7 +181,7 @@ func main() {
 		}
 		return
 	}
-	runApp(ctx, loop, skills, store.Path(), cfg, wd, len(agentFiles))
+	runApp(ctx, loop, skills, store.Path(), logStore.Path(), cfg, wd, len(agentFiles))
 }
 
 func runLogin(args []string) {
@@ -268,7 +291,7 @@ func (p *plain) Status(string)                               {}
 
 var commands = []string{
 	"/clear", "/compact", "/exit", "/help", "/login <openai|copilot> [subscription|api]",
-	"/effort", "/model <id>", "/models", "/session", "/skill <name>", "/skills",
+	"/effort", "/logs", "/model <id>", "/models", "/session", "/skill <name>", "/skills",
 }
 
 func commandName(command string) string { return strings.Fields(command)[0] }
@@ -531,6 +554,9 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 		case line == "/session":
 			fmt.Println(sessionPath)
 			continue
+		case line == "/logs":
+			fmt.Println(filepath.Join(wd, ".atom", "logs"))
+			continue
 		case line == "/skills":
 			for _, sk := range skills {
 				fmt.Printf("%s — %s\n", sk.Name, sk.Description)
@@ -656,10 +682,15 @@ type appModel struct {
 	loop          *agent.Loop
 	skills        []instructions.Skill
 	sessionPath   string
+	logPath       string
 	cfg           config.Config
 	wd            string
 	events        chan tea.Msg
 	input         string
+	inputCursor   int
+	inputAnchor   int
+	inputOffset   int
+	draggingInput bool
 	transcript    []string
 	queue         []string
 	busy          bool
@@ -681,10 +712,10 @@ type appModel struct {
 	toast         string
 }
 
-func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config, wd string, agentFiles int) {
+func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath, logPath string, cfg config.Config, wd string, agentFiles int) {
 	events := make(chan tea.Msg, 64)
 	loop.Observer = uiObserver{events: events}
-	m := appModel{ctx: ctx, loop: loop, skills: skills, sessionPath: sessionPath, cfg: cfg, wd: wd, events: events, width: 100, height: 30}
+	m := appModel{ctx: ctx, loop: loop, skills: skills, sessionPath: sessionPath, logPath: logPath, cfg: cfg, wd: wd, events: events, width: 100, height: 30}
 	if agentFiles > 0 {
 		m.transcript = append(m.transcript, fmt.Sprintf("Loaded %d AGENTS.md file(s)", agentFiles))
 	}
@@ -730,7 +761,7 @@ func (m *appModel) clampScroll() {
 }
 
 func (m appModel) transcriptHeight() int {
-	max := m.height - 6
+	max := m.height - len(atomLogo) - headerPadding - composerPadding - 5
 	if m.thinking {
 		max--
 	}
@@ -782,12 +813,13 @@ func (m appModel) selectionText() string {
 		a, z = z, a
 	}
 	lines, _ := m.visibleTranscript()
-	inputRow := m.height - 3
+	inputRow := m.height - 4
 	var out []string
 	for y := a.y; y <= z.y; y++ {
 		line, offset, ok := "", 0, false
-		if y >= 2 && y < 2+len(lines) {
-			line, ok = lines[y-2], true
+		headerRows := len(atomLogo) + headerPadding
+		if y >= headerRows && y < headerRows+len(lines) {
+			line, ok = lines[y-headerRows], true
 		} else if y == inputRow {
 			line, offset, ok = m.input, 4, true
 		}
@@ -820,10 +852,170 @@ func (m appModel) selectionText() string {
 	}
 	return strings.Join(out, "\n")
 }
+
+// inputWidth is deliberately one cell smaller than the available space. That
+// leaves room for the caret even when the input fills the prompt.
+func (m appModel) inputWidth() int {
+	width := m.width - 8
+	if width < 1 {
+		return 1
+	}
+	return width
+}
+
+func (m appModel) inputSelection() (int, int) {
+	a, z := m.inputAnchor, m.inputCursor
+	if a > z {
+		a, z = z, a
+	}
+	return a, z
+}
+
+func (m appModel) hasInputSelection() bool {
+	return m.inputAnchor != m.inputCursor
+}
+
+func (m *appModel) clampInputCursor() {
+	length := len([]rune(m.input))
+	if m.inputCursor < 0 {
+		m.inputCursor = 0
+	}
+	if m.inputCursor > length {
+		m.inputCursor = length
+	}
+	if m.inputAnchor < 0 {
+		m.inputAnchor = 0
+	}
+	if m.inputAnchor > length {
+		m.inputAnchor = length
+	}
+	if m.inputOffset < 0 {
+		m.inputOffset = 0
+	}
+	maxOffset := length - m.inputWidth() + 1
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.inputOffset > maxOffset {
+		m.inputOffset = maxOffset
+	}
+	if m.inputCursor < m.inputOffset {
+		m.inputOffset = m.inputCursor
+	}
+	if m.inputCursor >= m.inputOffset+m.inputWidth() {
+		m.inputOffset = m.inputCursor - m.inputWidth() + 1
+	}
+}
+
+func (m *appModel) moveInputCursor(to int, extend bool) {
+	m.clampInputCursor()
+	if !extend && m.hasInputSelection() {
+		from, until := m.inputSelection()
+		if to < m.inputCursor {
+			to = from
+		} else {
+			to = until
+		}
+	}
+	m.inputCursor = to
+	if !extend {
+		m.inputAnchor = to
+	}
+	m.clampInputCursor()
+}
+
+func previousWordBoundary(runes []rune, cursor int) int {
+	for cursor > 0 && unicode.IsSpace(runes[cursor-1]) {
+		cursor--
+	}
+	for cursor > 0 && !unicode.IsSpace(runes[cursor-1]) {
+		cursor--
+	}
+	return cursor
+}
+
+func nextWordBoundary(runes []rune, cursor int) int {
+	for cursor < len(runes) && unicode.IsSpace(runes[cursor]) {
+		cursor++
+	}
+	for cursor < len(runes) && !unicode.IsSpace(runes[cursor]) {
+		cursor++
+	}
+	return cursor
+}
+
+func (m *appModel) deleteInputRange(from, until int) {
+	runes := []rune(m.input)
+	if from < 0 {
+		from = 0
+	}
+	if until > len(runes) {
+		until = len(runes)
+	}
+	if until < from {
+		from, until = until, from
+	}
+	m.input = string(append(runes[:from], runes[until:]...))
+	m.inputCursor, m.inputAnchor = from, from
+	m.clampInputCursor()
+}
+
+func (m *appModel) deleteInputBackward(word bool) {
+	if m.hasInputSelection() {
+		from, until := m.inputSelection()
+		m.deleteInputRange(from, until)
+		return
+	}
+	from := m.inputCursor - 1
+	if word {
+		from = previousWordBoundary([]rune(m.input), m.inputCursor)
+	}
+	if from >= 0 {
+		m.deleteInputRange(from, m.inputCursor)
+	}
+}
+
+func (m *appModel) deleteInputForward() {
+	if m.hasInputSelection() {
+		from, until := m.inputSelection()
+		m.deleteInputRange(from, until)
+		return
+	}
+	runes := []rune(m.input)
+	if m.inputCursor < len(runes) {
+		m.deleteInputRange(m.inputCursor, m.inputCursor+1)
+	}
+}
+
+func (m *appModel) insertInput(text []rune) {
+	if m.hasInputSelection() {
+		from, until := m.inputSelection()
+		m.deleteInputRange(from, until)
+	}
+	runes := []rune(m.input)
+	at := m.inputCursor
+	runes = append(runes[:at], append(text, runes[at:]...)...)
+	m.input = string(runes)
+	m.inputCursor += len(text)
+	m.inputAnchor = m.inputCursor
+	m.clampInputCursor()
+}
+
+func (m appModel) inputIndexAt(x int) int {
+	index := m.inputOffset + x - 4
+	if index < 0 {
+		return 0
+	}
+	if length := len([]rune(m.input)); index > length {
+		return length
+	}
+	return index
+}
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.clampInputCursor()
 	case uiText:
 		m.thinking = false
 		if !m.assistantOpen {
@@ -840,6 +1032,10 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.assistantOpen = false
 			return m, tea.Batch(waitEvent(m.events), nextThinkingTick())
 		}
+		if strings.HasPrefix(string(msg), "retrying ") {
+			m.add("· " + string(msg))
+			return m, waitEvent(m.events)
+		}
 		return m, waitEvent(m.events)
 	case uiTool:
 		m.thinking = false
@@ -851,7 +1047,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitEvent(m.events)
 	case thinkingTick:
 		if m.thinking {
-			m.thinkingFrame = (m.thinkingFrame + 1) % 4
+			m.thinkingFrame = (m.thinkingFrame + 1) % len(workingFrames)
 			return m, nextThinkingTick()
 		}
 		return m, nil
@@ -941,7 +1137,25 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.scroll < 0 {
 				m.scroll = 0
 			}
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress && msg.Y == m.height-4 && msg.X >= 4:
+			m.selecting = false
+			m.draggingInput = true
+			m.inputCursor = m.inputIndexAt(msg.X)
+			if !msg.Shift {
+				m.inputAnchor = m.inputCursor
+			}
+			m.clampInputCursor()
+			return m, nil
+		case m.draggingInput && (msg.Action == tea.MouseActionMotion || msg.Action == tea.MouseActionRelease):
+			m.inputCursor = m.inputIndexAt(msg.X)
+			m.clampInputCursor()
+			if msg.Action == tea.MouseActionRelease {
+				m.draggingInput = false
+			}
+			return m, nil
 		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+			m.draggingInput = false
+			m.inputAnchor = m.inputCursor
 			m.selecting = true
 			m.selectionFrom = mousePoint{msg.X, msg.Y}
 			m.selectionTo = m.selectionFrom
@@ -969,9 +1183,9 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "esc":
 		m.menuKind, m.menu = "", nil
-	case "up":
+	case "left":
 		m.selected = (m.selected + len(m.menu) - 1) % len(m.menu)
-	case "down":
+	case "right":
 		m.selected = (m.selected + 1) % len(m.menu)
 	case "enter":
 		id := m.menu[m.selected]
@@ -1015,6 +1229,9 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				} else {
 					m.add("model set: " + id)
 				}
+				if len(model.Efforts) > 0 {
+					m.menuTitle, m.menuKind, m.menu, m.selected = "Select effort", "effort", model.Efforts, 0
+				}
 				break
 			}
 		}
@@ -1023,9 +1240,38 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.clampInputCursor()
 	switch k.String() {
 	case "ctrl+c":
 		return m, tea.Quit
+	case "left":
+		m.moveInputCursor(m.inputCursor-1, false)
+	case "right":
+		m.moveInputCursor(m.inputCursor+1, false)
+	case "shift+left":
+		m.moveInputCursor(m.inputCursor-1, true)
+	case "shift+right":
+		m.moveInputCursor(m.inputCursor+1, true)
+	case "ctrl+left":
+		m.moveInputCursor(previousWordBoundary([]rune(m.input), m.inputCursor), false)
+	case "ctrl+right":
+		m.moveInputCursor(nextWordBoundary([]rune(m.input), m.inputCursor), false)
+	case "ctrl+shift+left":
+		m.moveInputCursor(previousWordBoundary([]rune(m.input), m.inputCursor), true)
+	case "ctrl+shift+right":
+		m.moveInputCursor(nextWordBoundary([]rune(m.input), m.inputCursor), true)
+	case "home":
+		m.moveInputCursor(0, false)
+	case "end":
+		m.moveInputCursor(len([]rune(m.input)), false)
+	case "shift+home":
+		m.moveInputCursor(0, true)
+	case "shift+end":
+		m.moveInputCursor(len([]rune(m.input)), true)
+	case "ctrl+a":
+		m.inputAnchor = 0
+		m.inputCursor = len([]rune(m.input))
+		m.clampInputCursor()
 	case "up", "down", "ctrl+p", "ctrl+n":
 		matches := commandMatches(m.input)
 		if len(matches) > 0 {
@@ -1050,26 +1296,28 @@ func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.scroll < 0 {
 			m.scroll = 0
 		}
-	case "home":
+	case "ctrl+home":
 		m.scroll = 1 << 30
 		m.clampScroll()
-	case "end":
+	case "ctrl+end":
 		m.scroll = 0
-	case "backspace":
-		r := []rune(m.input)
-		if len(r) > 0 {
-			m.input = string(r[:len(r)-1])
-		}
+	case "backspace", "alt+backspace", "ctrl+h":
+		m.deleteInputBackward(k.Alt)
+	case "ctrl+w":
+		m.deleteInputBackward(true)
+	case "delete":
+		m.deleteInputForward()
 	case "enter":
 		line := strings.TrimSpace(m.input)
 		if matches := commandMatches(line); len(matches) > 0 {
 			line = commandName(matches[m.selected%len(matches)])
 		}
 		m.input, m.selected = "", 0
+		m.inputCursor, m.inputAnchor, m.inputOffset = 0, 0, 0
 		return m.submit(line)
 	default:
 		if len(k.Runes) > 0 {
-			m.input += string(k.Runes)
+			m.insertInput(k.Runes)
 		}
 	}
 	return m, nil
@@ -1089,6 +1337,8 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		m.add(strings.Join(commands, "  "))
 	case "/session":
 		m.add(m.sessionPath)
+	case "/logs":
+		m.add(m.logPath)
 	case "/skills":
 		if len(m.skills) == 0 {
 			m.add("no skills found")
@@ -1180,32 +1430,47 @@ func (m appModel) View() string {
 		width = 20
 	}
 	var b strings.Builder
-	header := fmt.Sprintf("\033[1mAtom %s\033[0m  \033[36m%s/%s\033[0m", version, m.loop.Provider.Name(), m.loop.Model)
-	if m.loop.ReasoningEffort != "" {
-		header += "  \033[36m· " + m.loop.ReasoningEffort + "\033[0m"
+	logoWidth := 0
+	for _, line := range atomLogo {
+		if lineWidth := len([]rune(strings.TrimRight(line, " "))); lineWidth > logoWidth {
+			logoWidth = lineWidth
+		}
 	}
-	fmt.Fprintln(&b, header)
-	fmt.Fprintf(&b, "\033[2m%s  ·  %s\033[0m  \033[36m· %s\033[0m\n", m.wd, authSource(m.loop.Provider), contextStatus(m.loop, m.cfg.ContextTokens))
+	for i, line := range atomLogo {
+		logo := strings.TrimRight(line, " ")
+		fmt.Fprintf(&b, "\033[36m%s\033[0m", logo)
+		if i == 1 || i == 2 {
+			gap := strings.Repeat(" ", logoWidth-len([]rune(logo))+3)
+			if i == 1 {
+				fmt.Fprintf(&b, "%s\033[1matom %s\033[0m", gap, version)
+			} else {
+				fmt.Fprintf(&b, "%s\033[2m%s\033[0m", gap, authSource(m.loop.Provider))
+			}
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteString(strings.Repeat("\n", headerPadding))
 	lines, _ := m.visibleTranscript()
 	max := m.transcriptHeight()
 	if m.scroll > 0 && len(lines) > 0 {
 		lines[0] = "↑ " + lines[0]
 	}
 	for i, line := range lines {
-		m.writeLine(&b, line, i+2)
+		m.writeLine(&b, line, len(atomLogo)+headerPadding+i)
 		b.WriteByte('\n')
 	}
 	for i := len(lines); i < max; i++ {
 		b.WriteByte('\n')
 	}
+	b.WriteString(strings.Repeat("\n", composerPadding))
 	if m.thinking {
-		fmt.Fprintf(&b, "\033[2m· thinking%s\033[0m\n", strings.Repeat(".", m.thinkingFrame+1))
+		fmt.Fprintf(&b, "\033[2mworking%s\033[0m\n", workingFrames[m.thinkingFrame%len(workingFrames)])
 	}
 	if m.toast != "" {
 		fmt.Fprintf(&b, "\033[7m %s \033[0m\n", m.toast)
 	}
 	if m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models" {
-		fmt.Fprintf(&b, "\033[1m%s\033[0m\n", m.menuTitle)
+		fmt.Fprintf(&b, "\033[1m%s\033[0m  \033[2m(←/→, Enter)\033[0m\n", m.menuTitle)
 		for i, item := range m.menu {
 			if i == m.selected {
 				fmt.Fprintf(&b, "\033[7m › %s \033[0m ", item)
@@ -1226,7 +1491,8 @@ func (m appModel) View() string {
 	}
 	fmt.Fprintf(&b, "\033[36m┌%s┐\033[0m\n", strings.Repeat("─", width-2))
 	fmt.Fprint(&b, "\033[36m│\033[0m › ")
-	m.writeSelected(&b, m.input, m.height-3, 4, "")
+	m.writeInput(&b)
+	b.WriteString("\033[K")
 	b.WriteByte('\n')
 	state := fmt.Sprintf("%s  ·  %s", m.loop.Provider.Name(), m.loop.Model)
 	if m.loop.ReasoningEffort != "" {
@@ -1238,8 +1504,39 @@ func (m appModel) View() string {
 	if len(m.queue) > 0 {
 		state += fmt.Sprintf("  ·  queued %d", len(m.queue))
 	}
-	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m  \033[2m%s  ↑↓/PgUp/PgDn/scroll  / commands\033[0m", strings.Repeat("─", width-2), state)
+	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m\n", strings.Repeat("─", width-2))
+	left, gap, right := footerParts(state, contextStatus(m.loop, m.cfg.ContextTokens), width)
+	fmt.Fprintf(&b, "\033[36m%s\033[0m%s\033[2m%s\033[0m", left, gap, right)
 	return b.String()
+}
+
+// footerParts keeps the model state at the left edge and the context state at
+// the right edge, while giving the context state priority in narrow terminals.
+func footerParts(left, right string, width int) (string, string, string) {
+	if width < 1 {
+		return "", "", ""
+	}
+	right = shortenLabel(right, width)
+	space := width - len([]rune(left)) - len([]rune(right))
+	if space < 1 {
+		left = shortenLabel(left, width-len([]rune(right))-1)
+		space = width - len([]rune(left)) - len([]rune(right))
+	}
+	return left, strings.Repeat(" ", space), right
+}
+
+func shortenLabel(label string, width int) string {
+	runes := []rune(label)
+	if width <= 0 {
+		return ""
+	}
+	if len(runes) <= width {
+		return label
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 func contextStatus(loop *agent.Loop, limit int) string {
@@ -1266,6 +1563,34 @@ func (m appModel) writeLine(b *strings.Builder, line string, y int) {
 		style = "\033[36m"
 	}
 	m.writeSelected(b, line, y, 0, style)
+}
+
+func (m appModel) writeInput(b *strings.Builder) {
+	m.clampInputCursor()
+	runes := []rune(m.input)
+	from, until := m.inputSelection()
+	end := m.inputOffset + m.inputWidth()
+	if end > len(runes) {
+		end = len(runes)
+	}
+	for i := m.inputOffset; i < end; i++ {
+		if i == m.inputCursor {
+			b.WriteString("\033[7m")
+			b.WriteRune(runes[i])
+			b.WriteString("\033[0m")
+			continue
+		}
+		if i >= from && i < until {
+			b.WriteString("\033[7m")
+			b.WriteRune(runes[i])
+			b.WriteString("\033[0m")
+			continue
+		}
+		b.WriteRune(runes[i])
+	}
+	if m.inputCursor == len(runes) {
+		b.WriteString("\033[7m \033[0m")
+	}
 }
 
 func (m appModel) writeSelected(b *strings.Builder, line string, y, offset int, style string) {

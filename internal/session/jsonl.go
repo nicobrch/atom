@@ -27,6 +27,9 @@ func New(workdir string) (*JSONL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, err
+	}
 	return Open(filepath.Join(dir, time.Now().Format("20060102-150405")+".jsonl"))
 }
 
@@ -34,8 +37,12 @@ func Open(path string) (*JSONL, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
 		return nil, err
 	}
 	return &JSONL{path: path, file: f}, nil

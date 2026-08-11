@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +31,39 @@ func TestResponsesSSEStreamsTextAndTools(t *testing.T) {
 	}
 	if len(events) != 4 || events[0].ToolCallDelta.Name != "read" || events[1].ToolCallDelta.Arguments != "{}" || events[2].TextDelta != "done" || events[3].InputTokens != 3 {
 		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestResponsesSSEPreservesFailureDetails(t *testing.T) {
+	input := `data: {"type":"response.failed","response":{"id":"resp_123","error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"Try again later"}}}` + "\n"
+	err := parseResponsesSSE(bytes.NewBufferString(input), make(chan agent.StreamEvent))
+	var failure *agent.ProviderError
+	if !errors.As(err, &failure) {
+		t.Fatalf("error = %v, want ProviderError", err)
+	}
+	if failure.Code != "rate_limit_exceeded" || failure.Type != "rate_limit_error" || failure.ResponseID != "resp_123" || failure.Message != "Try again later" {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
+func TestResponsesHTTPFailurePreservesRequestIDAndDetails(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Request-Id", "req_123")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"Try again later"}}`)
+	}))
+	defer s.Close()
+	p := &OpenAICompatible{BaseURL: s.URL, Token: "test", Responses: true}
+	events, errs := p.Stream(context.Background(), agent.Request{Model: "test"})
+	for range events {
+	}
+	err := <-errs
+	var failure *agent.ProviderError
+	if !errors.As(err, &failure) {
+		t.Fatalf("error = %v, want ProviderError", err)
+	}
+	if failure.StatusCode != http.StatusTooManyRequests || failure.RequestID != "req_123" || failure.Code != "rate_limit_exceeded" {
+		t.Fatalf("failure = %#v", failure)
 	}
 }
 

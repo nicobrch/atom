@@ -1,2 +1,4 @@
 /atom
+/.atom/config.json
+/.atom/logs/
 /.atom/sessions/

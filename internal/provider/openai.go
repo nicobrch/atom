@@ -257,7 +257,7 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 	}
 	return &OpenAICompatible{
 		ProviderName: "copilot", BaseURL: base, Token: token,
-		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1", "Openai-Intent": "conversation-edits"},
+		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1.2", "Openai-Intent": "conversation-edits"},
 	}, nil
 }
 
@@ -325,13 +325,13 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req agent.Request) (<-cha
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
-			errs <- err
+			errs <- providerFailure("serialize request", err)
 			return
 		}
 		url := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			errs <- err
+			errs <- providerFailure("create request", err)
 			return
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+p.Token)
@@ -353,23 +353,25 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req agent.Request) (<-cha
 		}
 		resp, err := client.Do(httpReq)
 		if err != nil {
-			errs <- err
+			errs <- providerFailure("transport", err)
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-			errs <- fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
+			errs <- httpFailure("HTTP response", resp.StatusCode, responseRequestID(resp.Header), b)
 			return
 		}
 		if err := parseSSE(resp.Body, events); err != nil {
-			errs <- err
+			errs <- enrichFailure(err, resp.StatusCode, responseRequestID(resp.Header))
 		}
 	}()
 	return events, errs
 }
 
 type chatChunk struct {
+	ID      string    `json:"id"`
+	Error   *apiError `json:"error"`
 	Choices []struct {
 		Delta struct {
 			Content   string `json:"content"`
@@ -394,7 +396,10 @@ func parseSSE(r io.Reader, out chan<- agent.StreamEvent) error {
 	return parseSSELines(r, func(data []byte) error {
 		var chunk chatChunk
 		if err := json.Unmarshal(data, &chunk); err != nil {
-			return fmt.Errorf("decode provider event: %w", err)
+			return providerFailure("decode stream event", err)
+		}
+		if chunk.Error != nil {
+			return responseFailure("stream", chunk.ID, *chunk.Error)
 		}
 		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 			out <- agent.StreamEvent{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}

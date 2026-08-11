@@ -79,11 +79,32 @@ Run `atom` without `-p` to enter the terminal UI. Commands are:
 - `/compact` — replace conversation history with a model-generated handoff
 - `/clear` — begin a fresh conversation in the current session file
 - `/session` — show the JSONL session path
+- `/logs` — show today's diagnostic-log path
 - `/skills` — list discovered skills
 - `/exit` — quit
 
 Every user, assistant, tool-call, tool-result, and compaction event is appended
 to `.atom/sessions/<timestamp>.jsonl`. Resume one with `--session PATH`.
+
+## Diagnostics
+
+Every normal model request writes metadata-only lifecycle events to
+`.atom/logs/<YYYY-MM-DD>.jsonl`: `request_started`, `request_succeeded`, or
+`request_failed`; a transient pre-output failure also emits `request_retrying`.
+Atom retries overloads, rate limits, 5xx failures, and transport failures up
+to three total attempts, waiting 2 seconds then 4 seconds. It never retries a
+stream after it has produced text or a tool call, avoiding duplicated output or
+side effects. Compaction uses the equivalent `compaction_*` events. A
+request failure includes Atom's correlation ID, provider,
+model, latency, token counts, HTTP status, provider request/response IDs, and
+the provider error code/type/message when supplied. The same failure is also
+appended to its session JSONL as an `error` record, without changing
+conversation replay.
+
+Diagnostic logs deliberately exclude prompts, system instructions, tool
+arguments/results, authorization headers, and raw HTTP bodies. Log directories
+and files are owner-only (`0700` and `0600`). Existing session files are made
+owner-only the next time Atom opens them.
 
 ## Project customization
 

@@ -2,9 +2,14 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 type Observer interface {
@@ -20,10 +25,18 @@ type Loop struct {
 	System                    string
 	Messages                  []Message
 	Sink                      EventSink
+	Diagnostics               DiagnosticSink
 	Observer                  Observer
 	InputTokens, OutputTokens int
 	ReasoningEffort           string
+	// RetryWait is injectable for tests. Production uses a cancellable timer.
+	RetryWait func(context.Context, time.Duration) error
 }
+
+const (
+	maxStreamAttempts = 3
+	initialRetryDelay = 2 * time.Second
+)
 
 func (l *Loop) Prompt(ctx context.Context, text string) error {
 	l.Messages = append(l.Messages, Message{Role: "user", Content: text})
@@ -44,39 +57,93 @@ func (l *Loop) run(ctx context.Context) error {
 		if l.Observer != nil {
 			l.Observer.Status("thinking")
 		}
-		events, errs := l.Provider.Stream(ctx, Request{Model: l.Model, System: l.System, Messages: l.Messages, Tools: defs, ReasoningEffort: l.ReasoningEffort})
+		req := Request{ID: newRequestID(), Model: l.Model, System: l.System, Messages: l.Messages, Tools: defs, ReasoningEffort: l.ReasoningEffort}
 		var text strings.Builder
 		calls := map[int]*ToolCall{}
 		var order []int
-		for e := range events {
-			l.InputTokens += e.InputTokens
-			l.OutputTokens += e.OutputTokens
-			if e.TextDelta != "" {
-				text.WriteString(e.TextDelta)
-				if l.Observer != nil {
-					l.Observer.Text(e.TextDelta)
+		requestStarted := time.Now()
+		totalInputTokens, totalOutputTokens := 0, 0
+		for attempt := 1; attempt <= maxStreamAttempts; attempt++ {
+			l.writeDiagnostic(DiagnosticEvent{
+				Event: "request_started", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+				ReasoningEffort: req.ReasoningEffort, Turn: turn + 1, Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages), ToolCount: len(req.Tools),
+			})
+			attemptStarted := time.Now()
+			events, errs := l.Provider.Stream(ctx, req)
+			var attemptText strings.Builder
+			attemptCalls := map[int]*ToolCall{}
+			var attemptOrder []int
+			attemptInputTokens, attemptOutputTokens := 0, 0
+			for e := range events {
+				l.InputTokens += e.InputTokens
+				l.OutputTokens += e.OutputTokens
+				attemptInputTokens += e.InputTokens
+				attemptOutputTokens += e.OutputTokens
+				if e.TextDelta != "" {
+					attemptText.WriteString(e.TextDelta)
+					if l.Observer != nil {
+						l.Observer.Text(e.TextDelta)
+					}
+				}
+				if d := e.ToolCallDelta; d != nil {
+					c, ok := attemptCalls[d.Index]
+					if !ok {
+						c = &ToolCall{}
+						attemptCalls[d.Index] = c
+						attemptOrder = append(attemptOrder, d.Index)
+					}
+					if d.ID != "" {
+						c.ID = d.ID
+					}
+					if d.Name != "" {
+						c.Name = d.Name
+					}
+					if d.Arguments != "" {
+						c.Arguments = append(c.Arguments, d.Arguments...)
+					}
 				}
 			}
-			if d := e.ToolCallDelta; d != nil {
-				c, ok := calls[d.Index]
-				if !ok {
-					c = &ToolCall{}
-					calls[d.Index] = c
-					order = append(order, d.Index)
+			totalInputTokens += attemptInputTokens
+			totalOutputTokens += attemptOutputTokens
+			if err := <-errs; err != nil {
+				failure := failureForDiagnostic(err)
+				if retryable(ctx, failure) && attemptText.Len() == 0 && len(attemptCalls) == 0 && attempt < maxStreamAttempts {
+					delay := retryDelay(attempt)
+					l.writeDiagnostic(DiagnosticEvent{
+						Event: "request_retrying", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+						ReasoningEffort: req.ReasoningEffort, Turn: turn + 1, Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages), ToolCount: len(req.Tools),
+						Duration: time.Since(attemptStarted), DurationMS: time.Since(attemptStarted).Milliseconds(), InputTokens: attemptInputTokens, OutputTokens: attemptOutputTokens,
+						RetryDelayMS: delay.Milliseconds(), Failure: failure,
+					})
+					if l.Observer != nil {
+						l.Observer.Status(retryStatus(failure, attempt+1, maxStreamAttempts, delay))
+					}
+					if waitErr := l.waitForRetry(ctx, delay); waitErr == nil {
+						continue
+					} else {
+						err = waitErr
+						failure = failureForDiagnostic(err)
+					}
 				}
-				if d.ID != "" {
-					c.ID = d.ID
+				diagnostic := DiagnosticEvent{
+					Event: "request_failed", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+					ReasoningEffort: req.ReasoningEffort, Turn: turn + 1, Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages), ToolCount: len(req.Tools),
+					Duration: time.Since(requestStarted), DurationMS: time.Since(requestStarted).Milliseconds(), InputTokens: totalInputTokens, OutputTokens: totalOutputTokens,
+					PartialTextChars: utf8.RuneCountInString(attemptText.String()), Failure: failure,
 				}
-				if d.Name != "" {
-					c.Name = d.Name
+				l.writeDiagnostic(diagnostic)
+				if recordErr := l.record("error", diagnostic); recordErr != nil {
+					return fmt.Errorf("%w (also failed to record diagnostic %s: %v)", err, req.ID, recordErr)
 				}
-				if d.Arguments != "" {
-					c.Arguments = append(c.Arguments, d.Arguments...)
-				}
+				return withDiagnosticID(err, req.ID)
 			}
-		}
-		if err := <-errs; err != nil {
-			return err
+			text, calls, order = attemptText, attemptCalls, attemptOrder
+			l.writeDiagnostic(DiagnosticEvent{
+				Event: "request_succeeded", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+				ReasoningEffort: req.ReasoningEffort, Turn: turn + 1, Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages), ToolCount: len(req.Tools),
+				Duration: time.Since(requestStarted), DurationMS: time.Since(requestStarted).Milliseconds(), InputTokens: totalInputTokens, OutputTokens: totalOutputTokens,
+			})
+			break
 		}
 		assistant := Message{Role: "assistant", Content: text.String()}
 		for _, i := range order {
@@ -120,6 +187,87 @@ func (l *Loop) run(ctx context.Context) error {
 	return fmt.Errorf("stopped after 32 tool turns")
 }
 
+func (l *Loop) writeDiagnostic(event DiagnosticEvent) {
+	if l.Diagnostics != nil {
+		// Diagnostics must never make an otherwise valid agent turn fail.
+		_ = l.Diagnostics.WriteDiagnostic(event)
+	}
+}
+
+func failureForDiagnostic(err error) *ProviderError {
+	var failure *ProviderError
+	if errors.As(err, &failure) {
+		return failure
+	}
+	return &ProviderError{Stage: "stream", Message: "provider returned an unclassified error"}
+}
+
+func newRequestID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err == nil {
+		return "atom_" + hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("atom_%x", time.Now().UnixNano())
+}
+
+func withDiagnosticID(err error, requestID string) error {
+	return fmt.Errorf("%w (diagnostic %s)", err, requestID)
+}
+
+func retryable(ctx context.Context, failure *ProviderError) bool {
+	if ctx.Err() != nil || failure == nil {
+		return false
+	}
+	if failure.StatusCode == 429 || failure.StatusCode >= 500 {
+		return true
+	}
+	switch failure.Stage {
+	case "transport":
+		return true
+	}
+	switch failure.Type {
+	case "service_unavailable_error", "server_error", "rate_limit_error":
+		return true
+	}
+	switch failure.Code {
+	case "server_is_overloaded", "rate_limit_exceeded", "internal_server_error", "timeout":
+		return true
+	}
+	return false
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	return initialRetryDelay * time.Duration(1<<(attempt-1))
+}
+
+func (l *Loop) waitForRetry(ctx context.Context, delay time.Duration) error {
+	if l.RetryWait != nil {
+		return l.RetryWait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func retryStatus(failure *ProviderError, nextAttempt, maxAttempts int, delay time.Duration) string {
+	reason := failure.Code
+	if reason == "" {
+		reason = failure.Type
+	}
+	if reason == "" {
+		reason = "transient provider error"
+	}
+	return fmt.Sprintf("retrying in %s after %s (attempt %d/%d)", delay, reason, nextAttempt, maxAttempts)
+}
+
 func (l *Loop) Compact(ctx context.Context) error {
 	if len(l.Messages) < 2 {
 		return nil
@@ -128,16 +276,70 @@ func (l *Loop) Compact(ctx context.Context) error {
 		l.Observer.Status("compacting")
 	}
 	prompt := "Summarize this coding session for the next agent turn. Preserve the user's goal, decisions, changed files, tests run, errors, and remaining work. Be concise."
-	events, errs := l.Provider.Stream(ctx, Request{Model: l.Model, System: prompt, Messages: l.Messages})
+	req := Request{ID: newRequestID(), Model: l.Model, System: prompt, Messages: l.Messages}
+	started := time.Now()
 	var b strings.Builder
-	for e := range events {
-		b.WriteString(e.TextDelta)
-		l.InputTokens += e.InputTokens
-		l.OutputTokens += e.OutputTokens
+	inputTokens, outputTokens := 0, 0
+	successfulAttempt := 0
+	for attempt := 1; attempt <= maxStreamAttempts; attempt++ {
+		l.writeDiagnostic(DiagnosticEvent{
+			Event: "compaction_started", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+			Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages),
+		})
+		attemptStarted := time.Now()
+		events, errs := l.Provider.Stream(ctx, req)
+		var attemptText strings.Builder
+		attemptInputTokens, attemptOutputTokens := 0, 0
+		for e := range events {
+			attemptText.WriteString(e.TextDelta)
+			l.InputTokens += e.InputTokens
+			l.OutputTokens += e.OutputTokens
+			attemptInputTokens += e.InputTokens
+			attemptOutputTokens += e.OutputTokens
+		}
+		inputTokens += attemptInputTokens
+		outputTokens += attemptOutputTokens
+		if err := <-errs; err != nil {
+			failure := failureForDiagnostic(err)
+			if retryable(ctx, failure) && attemptText.Len() == 0 && attempt < maxStreamAttempts {
+				delay := retryDelay(attempt)
+				l.writeDiagnostic(DiagnosticEvent{
+					Event: "compaction_retrying", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+					Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages),
+					Duration: time.Since(attemptStarted), DurationMS: time.Since(attemptStarted).Milliseconds(), InputTokens: attemptInputTokens, OutputTokens: attemptOutputTokens,
+					RetryDelayMS: delay.Milliseconds(), Failure: failure,
+				})
+				if l.Observer != nil {
+					l.Observer.Status(retryStatus(failure, attempt+1, maxStreamAttempts, delay))
+				}
+				if waitErr := l.waitForRetry(ctx, delay); waitErr == nil {
+					continue
+				} else {
+					err = waitErr
+					failure = failureForDiagnostic(err)
+				}
+			}
+			diagnostic := DiagnosticEvent{
+				Event: "compaction_failed", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+				Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages),
+				Duration: time.Since(started), DurationMS: time.Since(started).Milliseconds(), InputTokens: inputTokens, OutputTokens: outputTokens,
+				PartialTextChars: utf8.RuneCountInString(attemptText.String()), Failure: failure,
+			}
+			l.writeDiagnostic(diagnostic)
+			if recordErr := l.record("error", diagnostic); recordErr != nil {
+				return fmt.Errorf("%w (also failed to record diagnostic %s: %v)", err, req.ID, recordErr)
+			}
+			return withDiagnosticID(err, req.ID)
+		}
+		b = attemptText
+		successfulAttempt = attempt
+		break
 	}
-	if err := <-errs; err != nil {
-		return err
-	}
+	l.writeDiagnostic(DiagnosticEvent{
+		Event: "compaction_succeeded", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+		Attempt: successfulAttempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages),
+		Duration: time.Since(started), DurationMS: time.Since(started).Milliseconds(), InputTokens: inputTokens, OutputTokens: outputTokens,
+	})
 	summary := Message{Role: "user", Content: "Session handoff summary:\n" + b.String()}
 	l.Messages = []Message{summary}
 	if err := l.record("compaction", summary); err != nil {

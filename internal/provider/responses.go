@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/nicobrch/atom/internal/agent"
 )
@@ -44,12 +42,12 @@ func (p *OpenAICompatible) streamResponses(ctx context.Context, req agent.Reques
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
-			errs <- err
+			errs <- providerFailure("serialize request", err)
 			return
 		}
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL, bytes.NewReader(body))
 		if err != nil {
-			errs <- err
+			errs <- providerFailure("create request", err)
 			return
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+p.Token)
@@ -64,17 +62,17 @@ func (p *OpenAICompatible) streamResponses(ctx context.Context, req agent.Reques
 		}
 		resp, err := client.Do(httpReq)
 		if err != nil {
-			errs <- err
+			errs <- providerFailure("transport", err)
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-			errs <- fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
+			errs <- httpFailure("HTTP response", resp.StatusCode, responseRequestID(resp.Header), b)
 			return
 		}
 		if err := parseResponsesSSE(resp.Body, events); err != nil {
-			errs <- err
+			errs <- enrichFailure(err, resp.StatusCode, responseRequestID(resp.Header))
 		}
 	}()
 	return events, errs
@@ -90,7 +88,10 @@ func parseResponsesSSE(r io.Reader, out chan<- agent.StreamEvent) error {
 				CallID string `json:"call_id"`
 				Name   string `json:"name"`
 			} `json:"item"`
+			Error    apiError `json:"error"`
 			Response struct {
+				ID    string   `json:"id"`
+				Error apiError `json:"error"`
 				Usage struct {
 					InputTokens  int `json:"input_tokens"`
 					OutputTokens int `json:"output_tokens"`
@@ -98,7 +99,7 @@ func parseResponsesSSE(r io.Reader, out chan<- agent.StreamEvent) error {
 			} `json:"response"`
 		}
 		if err := json.Unmarshal(data, &event); err != nil {
-			return err
+			return providerFailure("decode stream event", err)
 		}
 		switch event.Type {
 		case "response.output_text.delta":
@@ -111,8 +112,14 @@ func parseResponsesSSE(r io.Reader, out chan<- agent.StreamEvent) error {
 			}
 		case "response.completed":
 			out <- agent.StreamEvent{FinishReason: "stop", InputTokens: event.Response.Usage.InputTokens, OutputTokens: event.Response.Usage.OutputTokens}
-		case "response.failed", "error":
-			return fmt.Errorf("responses request failed")
+		case "response.failed":
+			detail := event.Response.Error
+			if detail.Message == "" {
+				detail = event.Error
+			}
+			return responseFailure("stream", event.Response.ID, detail)
+		case "error":
+			return responseFailure("stream", event.Response.ID, event.Error)
 		}
 		return nil
 	})
