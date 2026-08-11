@@ -29,6 +29,10 @@ Atom starts without a selected provider or model. Use `/login` in the app (or
 `atom login openai` / `atom login copilot`) and then select one of the models
 available to that account before starting a conversation.
 
+## Documentation
+
+- [Documentation](docs/README.md)
+
 GitHub Copilot uses GitHub's supported Copilot CLI transport, bundled into Atom
 release builds. Run `atom login copilot`; Atom opens Copilot's login flow and
 the CLI owns GitHub authentication and model access.
