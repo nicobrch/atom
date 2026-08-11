@@ -631,6 +631,9 @@ type loginDone struct {
 	err      error
 }
 type thinkingTick struct{}
+type toastDone struct{}
+
+type mousePoint struct{ x, y int }
 
 type uiObserver struct{ events chan<- tea.Msg }
 
@@ -672,6 +675,10 @@ type appModel struct {
 	scroll        int
 	thinking      bool
 	thinkingFrame int
+	selecting     bool
+	selectionFrom mousePoint
+	selectionTo   mousePoint
+	toast         string
 }
 
 func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionPath string, cfg config.Config, wd string, agentFiles int) {
@@ -696,6 +703,9 @@ func (m appModel) startTurn(text string) tea.Cmd {
 		return turnDone{err: err}
 	}
 }
+func (m appModel) compact() tea.Cmd {
+	return func() tea.Msg { return turnDone{err: m.loop.Compact(m.ctx)} }
+}
 func (m appModel) loadModels() tea.Cmd {
 	return func() tea.Msg {
 		models, err := availableModels(m.ctx, m.loop.Provider)
@@ -706,13 +716,7 @@ func (m *appModel) add(line string) {
 	m.transcript = append(m.transcript, line)
 }
 func (m *appModel) clampScroll() {
-	max := m.height - 6
-	if m.thinking {
-		max--
-	}
-	if max < 3 {
-		max = 3
-	}
+	max := m.transcriptHeight()
 	limit := len(wrappedTranscript(m.transcript, m.width-2)) - max
 	if limit < 0 {
 		limit = 0
@@ -723,6 +727,98 @@ func (m *appModel) clampScroll() {
 	if m.scroll < 0 {
 		m.scroll = 0
 	}
+}
+
+func (m appModel) transcriptHeight() int {
+	max := m.height - 6
+	if m.thinking {
+		max--
+	}
+	if m.toast != "" {
+		max--
+	}
+	if (m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models") || len(commandMatches(m.input)) > 0 {
+		max--
+	}
+	if max < 3 {
+		return 3
+	}
+	return max
+}
+
+func (m appModel) visibleTranscript() ([]string, int) {
+	lines := wrappedTranscript(m.transcript, m.width-2)
+	max := m.transcriptHeight()
+	scroll := m.scroll
+	if limit := len(lines) - max; scroll > limit {
+		scroll = limit
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	start := len(lines) - max - scroll
+	if start < 0 {
+		start = 0
+	}
+	end := start + max
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return lines[start:end], start
+}
+
+func copyToClipboard(text string) error {
+	cmd := exec.Command("pbcopy")
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+func (m appModel) selectionText() string {
+	if !m.selecting {
+		return ""
+	}
+	a, z := m.selectionFrom, m.selectionTo
+	if z.y < a.y || (z.y == a.y && z.x < a.x) {
+		a, z = z, a
+	}
+	lines, _ := m.visibleTranscript()
+	inputRow := m.height - 3
+	var out []string
+	for y := a.y; y <= z.y; y++ {
+		line, offset, ok := "", 0, false
+		if y >= 2 && y < 2+len(lines) {
+			line, ok = lines[y-2], true
+		} else if y == inputRow {
+			line, offset, ok = m.input, 4, true
+		}
+		if !ok {
+			continue
+		}
+		from, to := 0, len([]rune(line))
+		if y == a.y {
+			from = a.x - offset
+		}
+		if y == z.y {
+			to = z.x - offset
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to < 0 {
+			to = 0
+		}
+		r := []rune(line)
+		if from > len(r) {
+			from = len(r)
+		}
+		if to > len(r) {
+			to = len(r)
+		}
+		if to > from {
+			out = append(out, string(r[from:to]))
+		}
+	}
+	return strings.Join(out, "\n")
 }
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -758,6 +854,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.thinkingFrame = (m.thinkingFrame + 1) % 4
 			return m, nextThinkingTick()
 		}
+		return m, nil
+	case toastDone:
+		m.toast = ""
 		return m, nil
 	case turnDone:
 		m.busy = false
@@ -834,13 +933,31 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.inputKey(msg)
 	case tea.MouseMsg:
-		switch msg.Type {
-		case tea.MouseWheelUp:
+		switch {
+		case msg.Button == tea.MouseButtonWheelUp:
 			m.scroll += 3
-		case tea.MouseWheelDown:
+		case msg.Button == tea.MouseButtonWheelDown:
 			m.scroll -= 3
 			if m.scroll < 0 {
 				m.scroll = 0
+			}
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+			m.selecting = true
+			m.selectionFrom = mousePoint{msg.X, msg.Y}
+			m.selectionTo = m.selectionFrom
+		case m.selecting && msg.Action == tea.MouseActionMotion:
+			m.selectionTo = mousePoint{msg.X, msg.Y}
+		case m.selecting && msg.Action == tea.MouseActionRelease:
+			m.selectionTo = mousePoint{msg.X, msg.Y}
+			text := m.selectionText()
+			m.selecting = false
+			if text != "" {
+				if err := copyToClipboard(text); err != nil {
+					m.toast = "copy failed: " + err.Error()
+				} else {
+					m.toast = "Copied to clipboard"
+				}
+				return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return toastDone{} })
 			}
 		}
 		m.clampScroll()
@@ -875,6 +992,17 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.add("error saving settings: " + err.Error())
 			} else {
 				m.add("effort set: " + id)
+			}
+			return m, nil
+		}
+		if m.menuKind == "skill" {
+			m.menuKind, m.menu = "", nil
+			text, err := instructions.LoadSkill(m.skills, id)
+			if err != nil {
+				m.add("error loading skill: " + err.Error())
+			} else {
+				m.loop.System += "\n\nSkill " + id + ":\n" + text
+				m.add("loaded skill: " + id)
 			}
 			return m, nil
 		}
@@ -956,10 +1084,40 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "/clear":
 		m.loop.Messages, m.transcript = nil, nil
+		m.add("conversation cleared")
 	case "/help":
 		m.add(strings.Join(commands, "  "))
 	case "/session":
 		m.add(m.sessionPath)
+	case "/skills":
+		if len(m.skills) == 0 {
+			m.add("no skills found")
+		}
+		for _, skill := range m.skills {
+			m.add(fmt.Sprintf("%s — %s", skill.Name, skill.Description))
+		}
+	case "/skill":
+		if m.busy {
+			m.add("wait for current turn before loading a skill")
+			return m, nil
+		}
+		if len(m.skills) == 0 {
+			m.add("no skills found")
+			return m, nil
+		}
+		m.menuTitle, m.menuKind, m.selected = "Load skill", "skill", 0
+		m.menu = make([]string, len(m.skills))
+		for i, skill := range m.skills {
+			m.menu[i] = skill.Name
+		}
+	case "/compact":
+		if m.busy {
+			m.add("wait for current turn before compacting")
+			return m, nil
+		}
+		m.busy = true
+		m.add("· compacting")
+		return m, m.compact()
 	case "/models":
 		m.menuKind = "models"
 		return m, m.loadModels()
@@ -984,6 +1142,21 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		}
 		m.menuTitle, m.menuKind, m.menu, m.selected = "Login provider", "login-provider", []string{"openai", "copilot"}, 0
 	default:
+		if strings.HasPrefix(line, "/skill ") {
+			if m.busy {
+				m.add("wait for current turn before loading a skill")
+				return m, nil
+			}
+			name := strings.TrimSpace(strings.TrimPrefix(line, "/skill "))
+			text, err := instructions.LoadSkill(m.skills, name)
+			if err != nil {
+				m.add("error loading skill: " + err.Error())
+			} else {
+				m.loop.System += "\n\nSkill " + name + ":\n" + text
+				m.add("loaded skill: " + name)
+			}
+			return m, nil
+		}
 		if strings.HasPrefix(line, "/") {
 			m.add("unsupported here: " + line)
 			return m, nil
@@ -1012,54 +1185,24 @@ func (m appModel) View() string {
 		header += "  \033[36m· " + m.loop.ReasoningEffort + "\033[0m"
 	}
 	fmt.Fprintln(&b, header)
-	fmt.Fprintf(&b, "\033[2m%s  ·  %s\033[0m\n", m.wd, authSource(m.loop.Provider))
-	lines := wrappedTranscript(m.transcript, width)
-	max := m.height - 6
-	if max < 3 {
-		max = 3
-	}
-	if m.thinking {
-		max--
-	}
-	if (m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models") || len(commandMatches(m.input)) > 0 {
-		max--
-	}
-	if max < 3 {
-		max = 3
-	}
-	maxScroll := len(lines) - max
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-	if m.scroll > maxScroll {
-		m.scroll = maxScroll
-	}
-	start := len(lines) - max - m.scroll
-	if start < 0 {
-		start = 0
-	}
-	end := start + max
-	if end > len(lines) {
-		end = len(lines)
-	}
-	lines = lines[start:end]
+	fmt.Fprintf(&b, "\033[2m%s  ·  %s\033[0m  \033[36m· %s\033[0m\n", m.wd, authSource(m.loop.Provider), contextStatus(m.loop, m.cfg.ContextTokens))
+	lines, _ := m.visibleTranscript()
+	max := m.transcriptHeight()
 	if m.scroll > 0 && len(lines) > 0 {
 		lines[0] = "↑ " + lines[0]
 	}
-	for _, line := range lines {
-		if strings.HasPrefix(line, "·") || strings.HasPrefix(line, "└") || strings.HasPrefix(line, "queued") || strings.HasPrefix(line, "model set:") || strings.HasPrefix(line, "Loaded ") {
-			fmt.Fprintf(&b, "\033[2m%s\033[0m\n", line)
-		} else if strings.HasPrefix(line, "› ") {
-			fmt.Fprintf(&b, "\033[36m%s\033[0m\n", line)
-		} else {
-			fmt.Fprintf(&b, "\033[97m%s\033[0m\n", line)
-		}
+	for i, line := range lines {
+		m.writeLine(&b, line, i+2)
+		b.WriteByte('\n')
 	}
 	for i := len(lines); i < max; i++ {
 		b.WriteByte('\n')
 	}
 	if m.thinking {
 		fmt.Fprintf(&b, "\033[2m· thinking%s\033[0m\n", strings.Repeat(".", m.thinkingFrame+1))
+	}
+	if m.toast != "" {
+		fmt.Fprintf(&b, "\033[7m %s \033[0m\n", m.toast)
 	}
 	if m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models" {
 		fmt.Fprintf(&b, "\033[1m%s\033[0m\n", m.menuTitle)
@@ -1082,7 +1225,9 @@ func (m appModel) View() string {
 		b.WriteByte('\n')
 	}
 	fmt.Fprintf(&b, "\033[36m┌%s┐\033[0m\n", strings.Repeat("─", width-2))
-	fmt.Fprintf(&b, "\033[36m│\033[0m › %s\n", m.input)
+	fmt.Fprint(&b, "\033[36m│\033[0m › ")
+	m.writeSelected(&b, m.input, m.height-3, 4, "")
+	b.WriteByte('\n')
 	state := fmt.Sprintf("%s  ·  %s", m.loop.Provider.Name(), m.loop.Model)
 	if m.loop.ReasoningEffort != "" {
 		state += "  ·  " + m.loop.ReasoningEffort
@@ -1095,6 +1240,88 @@ func (m appModel) View() string {
 	}
 	fmt.Fprintf(&b, "\033[36m└%s┘\033[0m  \033[2m%s  ↑↓/PgUp/PgDn/scroll  / commands\033[0m", strings.Repeat("─", width-2), state)
 	return b.String()
+}
+
+func contextStatus(loop *agent.Loop, limit int) string {
+	if limit < 1 {
+		limit = config.Defaults().ContextTokens
+	}
+	used := loop.ApproxTokens()
+	percent := used * 100 / limit
+	return fmt.Sprintf("ctx ~%s/%s (%d%%) · processed %s", formatTokens(used), formatTokens(limit), percent, formatTokens(loop.InputTokens+loop.OutputTokens))
+}
+
+func formatTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+func (m appModel) writeLine(b *strings.Builder, line string, y int) {
+	style := "\033[97m"
+	if strings.HasPrefix(line, "·") || strings.HasPrefix(line, "└") || strings.HasPrefix(line, "queued") || strings.HasPrefix(line, "model set:") || strings.HasPrefix(line, "Loaded ") {
+		style = "\033[2m"
+	} else if strings.HasPrefix(line, "› ") {
+		style = "\033[36m"
+	}
+	m.writeSelected(b, line, y, 0, style)
+}
+
+func (m appModel) writeSelected(b *strings.Builder, line string, y, offset int, style string) {
+	if style != "" {
+		b.WriteString(style)
+	}
+	a, z := m.selectionFrom, m.selectionTo
+	if !m.selecting || z.y < a.y || (z.y == a.y && z.x < a.x) {
+		if !m.selecting {
+			b.WriteString(line)
+			if style != "" {
+				b.WriteString("\033[0m")
+			}
+			return
+		}
+		a, z = z, a
+	}
+	if y < a.y || y > z.y {
+		b.WriteString(line)
+		if style != "" {
+			b.WriteString("\033[0m")
+		}
+		return
+	}
+	r := []rune(line)
+	from, to := 0, len(r)
+	if y == a.y {
+		from = a.x - offset
+	}
+	if y == z.y {
+		to = z.x - offset
+	}
+	if from < 0 {
+		from = 0
+	}
+	if to < 0 {
+		to = 0
+	}
+	if from > len(r) {
+		from = len(r)
+	}
+	if to > len(r) {
+		to = len(r)
+	}
+	if to <= from {
+		b.WriteString(line)
+	} else {
+		b.WriteString(string(r[:from]))
+		b.WriteString("\033[7m")
+		b.WriteString(string(r[from:to]))
+		b.WriteString("\033[27m")
+		b.WriteString(string(r[to:]))
+	}
+	if style != "" {
+		b.WriteString("\033[0m")
+	}
 }
 
 func nextThinkingTick() tea.Cmd {
