@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -798,8 +799,34 @@ func (m appModel) visibleTranscript() ([]string, int) {
 	return lines[start:end], start
 }
 
+func clipboardCommand(goos string, lookPath func(string) (string, error)) ([]string, error) {
+	if goos == "darwin" {
+		return []string{"pbcopy"}, nil
+	}
+	if goos == "windows" {
+		return []string{"clip.exe"}, nil
+	}
+	if goos == "linux" {
+		for _, command := range [][]string{
+			{"wl-copy"},
+			{"xclip", "-selection", "clipboard"},
+			{"xsel", "--clipboard", "--input"},
+		} {
+			if _, err := lookPath(command[0]); err == nil {
+				return command, nil
+			}
+		}
+		return nil, fmt.Errorf("no clipboard utility found; install wl-clipboard (Wayland) or xclip/xsel (X11)")
+	}
+	return nil, fmt.Errorf("clipboard is unsupported on %s", goos)
+}
+
 func copyToClipboard(text string) error {
-	cmd := exec.Command("pbcopy")
+	command, err := clipboardCommand(runtime.GOOS, exec.LookPath)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin = strings.NewReader(text)
 	return cmd.Run()
 }

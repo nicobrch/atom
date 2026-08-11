@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,6 +13,38 @@ import (
 	"github.com/nicobrch/atom/internal/instructions"
 	"github.com/nicobrch/atom/internal/provider"
 )
+
+func TestClipboardCommandUsesLinuxClipboardUtilities(t *testing.T) {
+	tests := []struct {
+		name      string
+		available map[string]bool
+		want      []string
+	}{
+		{name: "wayland", available: map[string]bool{"wl-copy": true}, want: []string{"wl-copy"}},
+		{name: "x11 xclip", available: map[string]bool{"xclip": true}, want: []string{"xclip", "-selection", "clipboard"}},
+		{name: "x11 xsel", available: map[string]bool{"xsel": true}, want: []string{"xsel", "--clipboard", "--input"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := clipboardCommand("linux", func(command string) (string, error) {
+				if tt.available[command] {
+					return "/usr/bin/" + command, nil
+				}
+				return "", errors.New("not found")
+			})
+			if err != nil || !slices.Equal(got, tt.want) {
+				t.Fatalf("clipboardCommand() = %q, %v; want %q, nil", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestClipboardCommandExplainsMissingLinuxUtility(t *testing.T) {
+	_, err := clipboardCommand("linux", func(string) (string, error) { return "", errors.New("not found") })
+	if err == nil || !strings.Contains(err.Error(), "install wl-clipboard") {
+		t.Fatalf("clipboardCommand() error = %v", err)
+	}
+}
 
 func TestCommandMatchesFiltersByTypedPrefix(t *testing.T) {
 	got := commandMatches("/m")
