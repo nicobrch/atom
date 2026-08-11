@@ -271,7 +271,17 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 	if err != nil {
 		return nil, err
 	}
-	token := saved.CopilotToken
+	token, base := saved.CopilotToken, os.Getenv("COPILOT_BASE_URL")
+	if saved.CopilotOAuthToken != "" {
+		var copilotBase string
+		token, copilotBase, err = copilotAPIToken(saved.CopilotOAuthToken)
+		if err != nil {
+			return nil, fmt.Errorf("Copilot subscription credentials expired or were revoked; run `atom login copilot subscription`: %w", err)
+		}
+		if base == "" {
+			base = copilotBase
+		}
+	}
 	if token == "" {
 		token = os.Getenv("COPILOT_TOKEN")
 	}
@@ -281,7 +291,6 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 	if token == "" {
 		return nil, fmt.Errorf("Copilot credentials not found: run `/login copilot` or `atom login copilot subscription`")
 	}
-	base := os.Getenv("COPILOT_BASE_URL")
 	if base == "" {
 		base = "https://api.githubcopilot.com"
 	}

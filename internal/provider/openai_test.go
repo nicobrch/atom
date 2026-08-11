@@ -123,6 +123,23 @@ func TestCopilotModelsUsesPickerAndChatCapabilities(t *testing.T) {
 	}
 }
 
+func TestCopilotAPITokenUsesEnterpriseEndpoint(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer oauth" || r.Header.Get("Copilot-Integration-Id") != "vscode-chat" {
+			t.Fatalf("unexpected headers: %#v", r.Header)
+		}
+		fmt.Fprint(w, `{"token":"api-token","endpoints":{"api":"https://api.enterprise.githubcopilot.com"}}`)
+	}))
+	defer s.Close()
+	old := copilotTokenURL
+	copilotTokenURL = s.URL
+	t.Cleanup(func() { copilotTokenURL = old })
+	token, base, err := copilotAPIToken("oauth")
+	if err != nil || token != "api-token" || base != "https://api.enterprise.githubcopilot.com" {
+		t.Fatalf("token=%q base=%q err=%v", token, base, err)
+	}
+}
+
 func TestResponsesSendsSelectedEffort(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {

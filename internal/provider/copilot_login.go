@@ -4,13 +4,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
-// copilotClientID belongs to Atom's GitHub OAuth app. It is public client
-// metadata, not a client secret; GitHub Device Flow only uses the client ID.
-const copilotClientID = "Ov23liymK8r0F637IA3P"
+const copilotClientID = "Iv1.b507a08c87ecfe98"
+
+var copilotTokenURL = "https://api.github.com/copilot_internal/v2/token"
+
+var copilotHeaders = map[string]string{
+	"User-Agent":             "GitHubCopilotChat/0.26.7",
+	"Editor-Version":         "vscode/1.99.3",
+	"Editor-Plugin-Version":  "copilot-chat/0.26.7",
+	"Copilot-Integration-Id": "vscode-chat",
+}
 
 type CopilotDeviceCode struct {
 	VerificationURI string `json:"verification_uri"`
@@ -27,6 +36,7 @@ func StartCopilotLogin() (CopilotDeviceCode, error) {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", copilotHeaders["User-Agent"])
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return CopilotDeviceCode{}, err
@@ -57,6 +67,7 @@ func FinishCopilotLogin(code CopilotDeviceCode) error {
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", copilotHeaders["User-Agent"])
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return err
@@ -71,7 +82,7 @@ func FinishCopilotLogin(code CopilotDeviceCode) error {
 			return err
 		}
 		if result.AccessToken != "" {
-			return SaveCopilotToken(result.AccessToken)
+			return SaveCopilotOAuthToken(result.AccessToken)
 		}
 		if result.Error != "authorization_pending" && result.Error != "slow_down" {
 			return fmt.Errorf("Copilot login failed: %s", result.Error)
@@ -82,4 +93,38 @@ func FinishCopilotLogin(code CopilotDeviceCode) error {
 		}
 		time.Sleep(time.Duration(delay) * time.Second)
 	}
+}
+
+func copilotAPIToken(oauthToken string) (string, string, error) {
+	req, err := http.NewRequest(http.MethodGet, copilotTokenURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+oauthToken)
+	for name, value := range copilotHeaders {
+		req.Header.Set(name, value)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return "", "", fmt.Errorf("refresh Copilot token: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var result struct {
+		Token     string `json:"token"`
+		Endpoints struct {
+			API string `json:"api"`
+		} `json:"endpoints"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("decode Copilot token: %w", err)
+	}
+	if result.Token == "" {
+		return "", "", fmt.Errorf("refresh Copilot token: empty token")
+	}
+	return result.Token, result.Endpoints.API, nil
 }
