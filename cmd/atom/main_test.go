@@ -53,7 +53,7 @@ func TestClipboardCommandExplainsMissingLinuxUtility(t *testing.T) {
 
 func TestCommandMatchesFiltersByTypedPrefix(t *testing.T) {
 	got := commandMatches("/m")
-	if len(got) != 2 || got[0] != "/model" || got[1] != "/models" {
+	if len(got) != 1 || got[0] != "/model" {
 		t.Fatalf("/m matches %q", got)
 	}
 }
@@ -294,6 +294,21 @@ func TestResumePickerUsesVerticalBoundedNavigation(t *testing.T) {
 	}
 }
 
+func TestModelPickerUsesVerticalBoundedNavigation(t *testing.T) {
+	m := appModel{menuKind: "model", menu: []string{"first", "second", "third"}, width: 80, height: 9}
+	got, _ := m.menuKey(tea.KeyMsg{Type: tea.KeyEnd})
+	m = got.(appModel)
+	got, _ = m.menuKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = got.(appModel)
+	if m.selected != 2 {
+		t.Fatalf("navigation should stop at last item, selected %d", m.selected)
+	}
+	view := m.View()
+	if !strings.Contains(view, "Select model") || !strings.Contains(view, "\n   second\n") || !strings.Contains(view, "\n\033[7m › third") || !strings.Contains(view, "↑ more models") {
+		t.Fatalf("model picker should render rows vertically: %q", view)
+	}
+}
+
 func TestSkillToolUsesProgressiveDisclosure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "SKILL.md")
@@ -355,7 +370,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 		cfg:    config.Defaults(),
 	}
 	view := m.View()
-	versionIndex := strings.Index(view, "atom 0.1.4")
+	versionIndex := strings.Index(view, "atom 0.2.0")
 	subscriptionIndex := strings.Index(view, "Sign in required")
 	if versionIndex < 0 || subscriptionIndex < 0 {
 		t.Fatalf("header metadata missing from view: %q", view[:100])
@@ -363,7 +378,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 	if strings.Count(view[:subscriptionIndex], "\n") <= strings.Count(view[:versionIndex], "\n") {
 		t.Fatalf("subscription should be below version")
 	}
-	if strings.Contains(view, "Atom 0.1.4") {
+	if strings.Contains(view, "Atom 0.2.0") {
 		t.Fatalf("version label should use lowercase atom")
 	}
 }

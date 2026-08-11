@@ -26,7 +26,7 @@ import (
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.1.4"
+const version = "0.2.0"
 const headerPadding = 1
 const composerPadding = 1
 
@@ -331,7 +331,7 @@ func (p *plain) Status(string)                               {}
 
 var commands = []string{
 	"/clear", "/compact", "/exit", "/help", "/login", "/effort", "/logs",
-	"/model", "/models", "/resume", "/session", "/skill", "/skills", "/update",
+	"/model", "/resume", "/session", "/skill", "/skills", "/update",
 }
 
 // resumableSession lets the UI atomically move the active conversation to a
@@ -577,7 +577,7 @@ func (m appModel) transcriptHeight() int {
 }
 
 func (m appModel) menuRows() int {
-	if m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models" {
+	if m.menuKind != "" && m.menuKind != "loading" {
 		return 2
 	}
 	if len(commandMatches(m.input)) > 0 {
@@ -999,17 +999,6 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.models = msg.models
-		if m.menuKind == "models" {
-			for _, model := range m.models {
-				mark := " "
-				if model.ID == m.loop.Model {
-					mark = "*"
-				}
-				m.add(fmt.Sprintf("%s %s", mark, model.ID))
-			}
-			m.menuKind = ""
-			return m, nil
-		}
 		if m.menuKind == "effort-loading" {
 			for _, model := range m.models {
 				if model.ID == m.loop.Model {
@@ -1054,17 +1043,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.menuKind = "loading"
 		return m, m.loadModels()
 	case tea.KeyMsg:
-		if m.menuKind != "" && m.menuKind != "models" {
+		if m.menuKind != "" {
 			return m.menuKey(msg)
 		}
 		return m.inputKey(msg)
 	case tea.MouseMsg:
-		if m.menuKind == "resume" {
+		if m.menuKind == "resume" || m.menuKind == "model" {
 			switch msg.Button {
 			case tea.MouseButtonWheelUp:
-				m.moveResumeSelection(-1)
+				m.moveMenuSelection(-1)
 			case tea.MouseButtonWheelDown:
-				m.moveResumeSelection(1)
+				m.moveMenuSelection(1)
 			}
 			return m, nil
 		}
@@ -1119,22 +1108,22 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.menuKind == "resume" {
+	if m.menuKind == "resume" || m.menuKind == "model" {
 		switch k.String() {
 		case "esc":
 			m.menuKind, m.menu, m.sessionHistory = "", nil, nil
 			return m, nil
 		case "up", "k":
-			m.moveResumeSelection(-1)
+			m.moveMenuSelection(-1)
 			return m, nil
 		case "down", "j":
-			m.moveResumeSelection(1)
+			m.moveMenuSelection(1)
 			return m, nil
 		case "pgup":
-			m.moveResumeSelection(-m.resumePageSize())
+			m.moveMenuSelection(-m.resumePageSize())
 			return m, nil
 		case "pgdown":
-			m.moveResumeSelection(m.resumePageSize())
+			m.moveMenuSelection(m.resumePageSize())
 			return m, nil
 		case "home":
 			m.selected = 0
@@ -1217,7 +1206,7 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *appModel) moveResumeSelection(delta int) {
+func (m *appModel) moveMenuSelection(delta int) {
 	m.selected += delta
 	if m.selected < 0 {
 		m.selected = 0
@@ -1436,9 +1425,6 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		m.busy = true
 		m.add("· compacting")
 		return m, m.compact()
-	case "/models":
-		m.menuKind = "models"
-		return m, m.loadModels()
 	case "/model":
 		if m.busy {
 			m.add("wait for current turn before changing model")
@@ -1487,7 +1473,10 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 
 func (m appModel) View() string {
 	if m.menuKind == "resume" {
-		return m.resumeView()
+		return m.pickerView("Resume session", "resume", "sessions", "session(s)")
+	}
+	if m.menuKind == "model" {
+		return m.pickerView("Select model", "select", "models", "model(s)")
 	}
 	width := m.width - 2
 	if width < 20 {
@@ -1533,7 +1522,7 @@ func (m appModel) View() string {
 	if m.toast != "" {
 		fmt.Fprintf(&b, "\033[7m %s \033[0m\n", m.toast)
 	}
-	if m.menuKind != "" && m.menuKind != "loading" && m.menuKind != "models" {
+	if m.menuKind != "" && m.menuKind != "loading" {
 		fmt.Fprintf(&b, "\033[1m%s\033[0m  \033[2m(←/→, Enter)\033[0m\n", m.menuTitle)
 		for i, item := range m.menu {
 			if i == m.selected {
@@ -1581,7 +1570,7 @@ func (m appModel) View() string {
 	return b.String()
 }
 
-func (m appModel) resumeView() string {
+func (m appModel) pickerView(title, action, moreLabel, countLabel string) string {
 	width := m.width
 	if width < 20 {
 		width = 20
@@ -1603,9 +1592,9 @@ func (m appModel) resumeView() string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "\033[1mResume session\033[0m  \033[2m(↑/↓ move, Enter resume, Esc cancel)\033[0m\n\n")
+	fmt.Fprintf(&b, "\033[1m%s\033[0m  \033[2m(↑/↓ move, Enter %s, Esc cancel)\033[0m\n\n", title, action)
 	if start > 0 {
-		b.WriteString("\033[2m↑ more sessions\033[0m\n")
+		fmt.Fprintf(&b, "\033[2m↑ more %s\033[0m\n", moreLabel)
 	}
 	for i := start; i < end; i++ {
 		label := truncateRunes(m.menu[i], width-4)
@@ -1616,9 +1605,9 @@ func (m appModel) resumeView() string {
 		}
 	}
 	if end < len(m.menu) {
-		b.WriteString("\033[2m↓ more sessions\033[0m\n")
+		fmt.Fprintf(&b, "\033[2m↓ more %s\033[0m\n", moreLabel)
 	}
-	fmt.Fprintf(&b, "\n\033[2m%d session(s)\033[0m", len(m.menu))
+	fmt.Fprintf(&b, "\n\033[2m%d %s\033[0m", len(m.menu), countLabel)
 	return b.String()
 }
 
