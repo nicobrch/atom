@@ -513,6 +513,9 @@ func updateAtom(dir string, run updateCommand) error {
 	if err := run(source, "git", "pull", "--ff-only"); err != nil {
 		return fmt.Errorf("pull update: %w", err)
 	}
+	if err := run(source, "go", "tool", "bundler", "-output", "cmd/atom"); err != nil {
+		return fmt.Errorf("bundle Copilot CLI: %w", err)
+	}
 	target := filepath.Join(dir, "atom")
 	if runtime.GOOS == "windows" {
 		target += ".exe"

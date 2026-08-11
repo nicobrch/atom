@@ -69,6 +69,7 @@ func TestUpdateAtomPullsAndRebuildsGlobalInstallation(t *testing.T) {
 	}
 	want := [][]string{
 		{"/home/user/.atom", "git", "pull", "--ff-only"},
+		{"/home/user/.atom", "go", "tool", "bundler", "-output", "cmd/atom"},
 		{"/home/user/.atom", "go", "build", "-o", "/home/user/.atom/atom", "./cmd/atom"},
 	}
 	if !slices.EqualFunc(calls, want, func(a, b []string) bool { return slices.Equal(a, b) }) {
@@ -90,7 +91,7 @@ func TestUpdateAtomUsesSourceSubdirectory(t *testing.T) {
 	if err := updateAtom(home, run); err != nil {
 		t.Fatal(err)
 	}
-	if calls[0][0] != source || calls[1][0] != source || calls[1][4] != filepath.Join(home, "atom") {
+	if calls[0][0] != source || calls[1][0] != source || calls[2][0] != source || calls[2][4] != filepath.Join(home, "atom") {
 		t.Fatalf("update commands = %q", calls)
 	}
 }
