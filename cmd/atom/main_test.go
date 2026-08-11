@@ -108,6 +108,30 @@ func TestUpdateAtomStopsWhenPullFails(t *testing.T) {
 	}
 }
 
+func TestRemoveLegacyCopilotBundle(t *testing.T) {
+	source := t.TempDir()
+	dir := filepath.Join(source, "cmd", "atom")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(dir, "zcopilot_darwin_arm64.go")
+	keep := filepath.Join(dir, "main.go")
+	for _, path := range []string{legacy, keep} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeLegacyCopilotBundle(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy bundle remains: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("unrelated source removed: %v", err)
+	}
+}
+
 func TestCommandsDoNotAdvertiseArguments(t *testing.T) {
 	for _, command := range commands {
 		if strings.ContainsAny(command, " <>[]") {
@@ -447,7 +471,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 		cfg:    config.Defaults(),
 	}
 	view := m.View()
-	versionIndex := strings.Index(view, "atom 0.3.0")
+	versionIndex := strings.Index(view, "atom 0.3.1")
 	subscriptionIndex := strings.Index(view, "Sign in required")
 	if versionIndex < 0 || subscriptionIndex < 0 {
 		t.Fatalf("header metadata missing from view: %q", view[:100])

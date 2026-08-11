@@ -4,6 +4,8 @@ go 1.24.0
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
+	github.com/github/copilot-sdk/go v1.0.9
+	github.com/klauspost/compress v1.18.3
 	golang.org/x/term v0.35.0
 )
 

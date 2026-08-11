@@ -28,7 +28,7 @@ import (
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.3.0"
+const version = "0.3.1"
 const headerPadding = 1
 const composerPadding = 1
 
@@ -679,12 +679,28 @@ func updateAtom(dir string, run updateCommand) error {
 	if err := run(source, "git", "pull", "--ff-only"); err != nil {
 		return fmt.Errorf("pull update: %w", err)
 	}
+	if err := removeLegacyCopilotBundle(source); err != nil {
+		return fmt.Errorf("clean legacy Copilot bundle: %w", err)
+	}
 	target := filepath.Join(dir, "atom")
 	if runtime.GOOS == "windows" {
 		target += ".exe"
 	}
 	if err := run(source, "go", "build", "-o", target, "./cmd/atom"); err != nil {
 		return fmt.Errorf("build update: %w", err)
+	}
+	return nil
+}
+
+func removeLegacyCopilotBundle(source string) error {
+	matches, err := filepath.Glob(filepath.Join(source, "cmd", "atom", "zcopilot*"))
+	if err != nil {
+		return err
+	}
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
 	}
 	return nil
 }
