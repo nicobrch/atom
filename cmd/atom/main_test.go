@@ -16,6 +16,7 @@ import (
 	"github.com/nicobrch/atom/internal/config"
 	"github.com/nicobrch/atom/internal/instructions"
 	"github.com/nicobrch/atom/internal/provider"
+	"github.com/nicobrch/atom/internal/session"
 )
 
 func TestClipboardCommandUsesLinuxClipboardUtilities(t *testing.T) {
@@ -52,8 +53,27 @@ func TestClipboardCommandExplainsMissingLinuxUtility(t *testing.T) {
 
 func TestCommandMatchesFiltersByTypedPrefix(t *testing.T) {
 	got := commandMatches("/m")
-	if len(got) != 2 || got[0] != "/model <id>" || got[1] != "/models" {
+	if len(got) != 2 || got[0] != "/model" || got[1] != "/models" {
 		t.Fatalf("/m matches %q", got)
+	}
+}
+
+func TestCommandsDoNotAdvertiseArguments(t *testing.T) {
+	for _, command := range commands {
+		if strings.ContainsAny(command, " <>[]") {
+			t.Fatalf("command %q advertises arguments", command)
+		}
+	}
+}
+
+func TestArgumentBearingCommandsAreRejected(t *testing.T) {
+	m := appModel{loop: &agent.Loop{}}
+	for _, line := range []string{"/login openai", "/model gpt-5.4", "/skill review"} {
+		got, _ := m.submit(line)
+		m = got.(appModel)
+		if m.transcript[len(m.transcript)-1] != "unsupported here: "+line {
+			t.Fatalf("%q result = %q", line, m.transcript)
+		}
 	}
 }
 
@@ -66,6 +86,37 @@ func TestWrappedTranscriptKeepsLongResponsesWithinViewport(t *testing.T) {
 		if len([]rune(line)) > 8 {
 			t.Fatalf("wide line %q", line)
 		}
+	}
+}
+
+func TestRenderedTranscriptFormatsAssistantMarkdown(t *testing.T) {
+	lines := renderedTranscript([]string{"## Recommended next steps\n\n1. **Add secret scanning** before every push.\n- [ ] Keep `.atom/logs/` ignored.\n> This is a note.\n\n```go\nfmt.Println(\"hello\")\n```"}, 80)
+	got := make([]string, len(lines))
+	for i, line := range lines {
+		got[i] = line.text
+	}
+	want := []string{
+		"Recommended next steps",
+		"",
+		"1. Add secret scanning before every push.",
+		"☐ Keep .atom/logs/ ignored.",
+		"│ This is a note.",
+		"",
+		`fmt.Println("hello")`,
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("rendered lines = %q, want %q", got, want)
+	}
+	if lines[0].kind != markdownHeading || lines[4].kind != markdownQuote || lines[6].kind != markdownCode {
+
+		t.Fatalf("Markdown styles = %#v", lines)
+	}
+}
+
+func TestRenderedTranscriptLeavesUserMarkdownUntouched(t *testing.T) {
+	lines := renderedTranscript([]string{"› explain **this**"}, 80)
+	if len(lines) != 1 || lines[0].text != "› explain **this**" {
+		t.Fatalf("user prompt was reformatted: %#v", lines)
 	}
 }
 
@@ -106,6 +157,91 @@ func TestSkillsAndCompactCommandsAreHandled(t *testing.T) {
 	m = got.(appModel)
 	if !m.busy || cmd == nil || m.transcript[len(m.transcript)-1] != "· compacting" {
 		t.Fatalf("compact state: busy=%v transcript=%q", m.busy, m.transcript)
+	}
+}
+
+func TestResumeLoadsSelectedSessionAndMakesItActive(t *testing.T) {
+	wd := t.TempDir()
+	current, err := session.New(wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+	previousPath := filepath.Join(wd, ".atom", "sessions", "previous.jsonl")
+	previous, err := session.Open(previousPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := previous.WriteEvent("message", agent.Message{Role: "user", Content: "resume this"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := previous.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	m := appModel{loop: &agent.Loop{}, session: &resumableSession{store: current}, wd: wd}
+	got, _ := m.submit("/resume")
+	m = got.(appModel)
+	if m.menuKind != "resume" || len(m.menu) != 1 {
+		t.Fatalf("resume menu = %q, %q", m.menuKind, m.menu)
+	}
+	for i, entry := range m.sessionHistory {
+		if entry.Path == previousPath {
+			m.selected = i
+			break
+		}
+	}
+	got, _ = m.menuKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = got.(appModel)
+	if m.session.Path() != previousPath || len(m.loop.Messages) != 1 || m.loop.Messages[0].Content != "resume this" {
+		t.Fatalf("resume state = path %q messages %#v", m.session.Path(), m.loop.Messages)
+	}
+	if len(m.transcript) < 2 || m.transcript[0] != "› resume this" {
+		t.Fatalf("resumed transcript = %q", m.transcript)
+	}
+	if _, err := os.Stat(current.Path()); !os.IsNotExist(err) {
+		t.Fatalf("empty initial session should be removed, stat error = %v", err)
+	}
+}
+
+func TestTranscriptForMessagesRestoresConversationAndToolActivity(t *testing.T) {
+	lines := transcriptForMessages([]agent.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "Hi", ToolCalls: []agent.ToolCall{{Name: "bash"}}},
+		{Role: "tool", Content: "done"},
+	})
+	want := []string{"› hello", "", "Hi", "└─ bash  done"}
+	if !slices.Equal(lines, want) {
+		t.Fatalf("transcript = %q, want %q", lines, want)
+	}
+}
+
+func TestLiveAssistantResponseStartsOnASeparateLine(t *testing.T) {
+	m := appModel{transcript: []string{"› hello"}}
+	got, _ := m.Update(uiText("Hi"))
+	m = got.(appModel)
+	if !slices.Equal(m.transcript, []string{"› hello", "", "Hi"}) {
+		t.Fatalf("live transcript = %q", m.transcript)
+	}
+}
+
+func TestResumePickerUsesVerticalBoundedNavigation(t *testing.T) {
+	m := appModel{menuKind: "resume", menu: []string{"first", "second", "third"}, width: 80, height: 9}
+	got, _ := m.menuKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = got.(appModel)
+	if m.selected != 1 {
+		t.Fatalf("down selected %d, want 1", m.selected)
+	}
+	got, _ = m.menuKey(tea.KeyMsg{Type: tea.KeyEnd})
+	m = got.(appModel)
+	got, _ = m.menuKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = got.(appModel)
+	if m.selected != 2 {
+		t.Fatalf("navigation should stop at last item, selected %d", m.selected)
+	}
+	view := m.View()
+	if !strings.Contains(view, "Resume session") || !strings.Contains(view, "\n   second\n") || !strings.Contains(view, "\n\033[7m › third") || !strings.Contains(view, "↑ more sessions") {
+		t.Fatalf("resume picker should render rows vertically: %q", view)
 	}
 }
 
@@ -170,7 +306,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 		cfg:    config.Defaults(),
 	}
 	view := m.View()
-	versionIndex := strings.Index(view, "atom 0.1.2")
+	versionIndex := strings.Index(view, "atom 0.1.3")
 	subscriptionIndex := strings.Index(view, "OpenAI API key")
 	if versionIndex < 0 || subscriptionIndex < 0 {
 		t.Fatalf("header metadata missing from view: %q", view[:100])
@@ -178,7 +314,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 	if strings.Count(view[:subscriptionIndex], "\n") <= strings.Count(view[:versionIndex], "\n") {
 		t.Fatalf("subscription should be below version")
 	}
-	if strings.Contains(view, "Atom 0.1.2") {
+	if strings.Contains(view, "Atom 0.1.3") {
 		t.Fatalf("version label should use lowercase atom")
 	}
 }
@@ -259,6 +395,58 @@ func TestInputEditorDeletesWordsAndForwardCharacters(t *testing.T) {
 	m = got.(appModel)
 	if m.input != "hello" || m.inputCursor != 5 {
 		t.Fatalf("forward delete = %q at %d", m.input, m.inputCursor)
+	}
+}
+
+func TestComposerWrapsLongInputIntoVerticalRows(t *testing.T) {
+	m := appModel{
+		width:       20,
+		height:      30,
+		input:       "abcdefghijklmnopqrstuv",
+		inputCursor: len([]rune("abcdefghijklmnopqrstuv")),
+		inputAnchor: len([]rune("abcdefghijklmnopqrstuv")),
+		loop:        &agent.Loop{Provider: unavailableProvider{}},
+		cfg:         config.Defaults(),
+	}
+	lines := m.inputLines()
+	if len(lines) != 2 || lines[0].text != "abcdefghijkl" || lines[1].text != "mnopqrstuv" {
+		t.Fatalf("input lines = %#v", lines)
+	}
+	if m.composerRows() != 2 {
+		t.Fatalf("composer rows = %d, want 2", m.composerRows())
+	}
+	view := m.View()
+	if !strings.Contains(view, "│\033[0m › abcdefghijkl") || !strings.Contains(view, "│\033[0m   mnopqrstuv") {
+		t.Fatalf("composer did not render vertical rows: %q", view)
+	}
+}
+
+func TestWrappedUserPromptKeepsUserStyleOnContinuationLines(t *testing.T) {
+	lines := wrappedTranscript([]string{"› one two three four"}, 8)
+	if len(lines) < 2 {
+		t.Fatalf("wrapped user prompt = %q", lines)
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "› ") {
+			t.Fatalf("user continuation lost its prefix: %q", lines)
+		}
+	}
+}
+
+func TestComposerAndTranscriptStayWithinTerminalHeight(t *testing.T) {
+	m := appModel{
+		width:       80,
+		height:      30,
+		input:       strings.Repeat("x", 320),
+		inputCursor: 320,
+		inputAnchor: 320,
+		transcript:  []string{strings.Repeat("response ", 100)},
+		thinking:    true,
+		loop:        &agent.Loop{Provider: unavailableProvider{}},
+		cfg:         config.Defaults(),
+	}
+	if rows := strings.Count(m.View(), "\n") + 1; rows > m.height {
+		t.Fatalf("view has %d rows in a %d-row terminal", rows, m.height)
 	}
 }
 

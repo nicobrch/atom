@@ -1,0 +1,9 @@
+# Gitleaks configuration for Atom.
+# Default Gitleaks rules remain enabled. The allowlist below excludes only
+# deterministic dependency-integrity checksums, which are not credentials.
+
+[allowlist]
+description = "Go module checksums are public integrity hashes, not secrets."
+paths = [
+  '''(^|/)go\.sum$''',
+]

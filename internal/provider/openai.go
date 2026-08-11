@@ -257,7 +257,7 @@ func CopilotFromEnv() (*OpenAICompatible, error) {
 	}
 	return &OpenAICompatible{
 		ProviderName: "copilot", BaseURL: base, Token: token,
-		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1.2", "Openai-Intent": "conversation-edits"},
+		Headers: map[string]string{"Editor-Plugin-Version": "atom/0.1.3", "Openai-Intent": "conversation-edits"},
 	}, nil
 }
 

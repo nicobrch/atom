@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/nicobrch/atom/internal/agent"
@@ -20,6 +22,13 @@ type Record struct {
 type JSONL struct {
 	path string
 	file *os.File
+}
+
+// HistoryEntry is a resumable session in a workspace's local history.
+type HistoryEntry struct {
+	Path     string
+	Modified time.Time
+	Preview  string
 }
 
 func New(workdir string) (*JSONL, error) {
@@ -79,14 +88,59 @@ func LoadMessages(path string) ([]agent.Message, error) {
 		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
 			return nil, fmt.Errorf("invalid session record: %w", err)
 		}
-		if r.Type != "message" {
-			continue
+		switch r.Type {
+		case "message":
+			var m agent.Message
+			if err := json.Unmarshal(r.Data, &m); err != nil {
+				return nil, err
+			}
+			messages = append(messages, m)
+		case "compaction":
+			var summary agent.Message
+			if err := json.Unmarshal(r.Data, &summary); err != nil {
+				return nil, err
+			}
+			messages = []agent.Message{summary}
 		}
-		var m agent.Message
-		if err := json.Unmarshal(r.Data, &m); err != nil {
-			return nil, err
-		}
-		messages = append(messages, m)
 	}
 	return messages, sc.Err()
+}
+
+// History returns workspace sessions from newest to oldest. A short preview of
+// the most recent user message makes the picker useful without reading session
+// contents into the UI.
+func History(workdir string) ([]HistoryEntry, error) {
+	dir := filepath.Join(workdir, ".atom", "sessions")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	history := make([]HistoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		messages, err := LoadMessages(path)
+		if err != nil {
+			return nil, fmt.Errorf("read session %s: %w", path, err)
+		}
+		preview := "(empty session)"
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+				preview = strings.Join(strings.Fields(messages[i].Content), " ")
+				break
+			}
+		}
+		history = append(history, HistoryEntry{Path: path, Modified: info.ModTime(), Preview: preview})
+	}
+	slices.SortFunc(history, func(a, b HistoryEntry) int { return b.Modified.Compare(a.Modified) })
+	return history, nil
 }

@@ -20,6 +20,25 @@ atom
 
 When developing from a checkout, use `go install ./cmd/atom` instead.
 
+## Repository hygiene
+
+Atom's runtime state can contain private configuration, conversation transcripts,
+tool output, and diagnostics. The repository ignores the complete project-local
+`.atom/` directory, local build output, environment files, and common
+certificate/key formats. Do not force-add those files; store only sanitized
+examples such as `.env.example`.
+
+Secret scanning runs in GitHub Actions for every push and pull request, with
+complete Git history. Before pushing, install
+[Gitleaks](https://github.com/gitleaks/gitleaks) and run:
+
+```bash
+make secrets
+```
+
+The scan redacts values in its output. It uses the standard Gitleaks rules and
+only excludes `go.sum`, whose values are public dependency-integrity checksums.
+
 ### Installing from the private repository
 
 If the repository remains private, configure Go to skip the public module proxy
@@ -79,12 +98,16 @@ Run `atom` without `-p` to enter the terminal UI. Commands are:
 - `/compact` — replace conversation history with a model-generated handoff
 - `/clear` — begin a fresh conversation in the current session file
 - `/session` — show the JSONL session path
+- `/resume` — choose a previous workspace session and continue it
 - `/logs` — show today's diagnostic-log path
+- `/model`, `/effort`, `/login`, and `/skill` — open a picker; these commands
+  do not accept arguments
 - `/skills` — list discovered skills
 - `/exit` — quit
 
 Every user, assistant, tool-call, tool-result, and compaction event is appended
-to `.atom/sessions/<timestamp>.jsonl`. Resume one with `--session PATH`.
+to `.atom/sessions/<timestamp>.jsonl`. Use `/resume` to select one from the
+current workspace's history. `--session PATH` remains available for scripting.
 
 ## Diagnostics
 

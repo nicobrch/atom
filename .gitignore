@@ -1,4 +1,21 @@
+# Local build output
 /atom
-/.atom/config.json
-/.atom/logs/
-/.atom/sessions/
+
+# Atom runtime state: may contain private configuration, transcripts, tool output,
+# and operational diagnostics. Keep the entire directory out of version control.
+/.atom/
+
+# Environment files and commonly committed credential/certificate material.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Editor and operating-system local state.
+.DS_Store
