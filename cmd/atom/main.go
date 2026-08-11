@@ -192,7 +192,7 @@ func main() {
 		}
 		return
 	}
-	runApp(ctx, loop, skills, sessionSink, logStore.Path(), cfg, wd, len(agentFiles))
+	runApp(ctx, loop, skills, sessionSink, logStore.Path(), atomHome, cfg, wd, len(agentFiles))
 }
 
 func runLogin(args []string) {
@@ -327,7 +327,7 @@ func (p *plain) Status(string)                               {}
 
 var commands = []string{
 	"/clear", "/compact", "/exit", "/help", "/login", "/effort", "/logs",
-	"/model", "/models", "/resume", "/session", "/skill", "/skills",
+	"/model", "/models", "/resume", "/session", "/skill", "/skills", "/update",
 }
 
 // resumableSession lets the UI atomically move the active conversation to a
@@ -402,6 +402,7 @@ type loginDone struct {
 	provider string
 	err      error
 }
+type updateDone struct{ err error }
 type thinkingTick struct{}
 type toastDone struct{}
 
@@ -430,6 +431,7 @@ type appModel struct {
 	session        *resumableSession
 	sessionHistory []session.HistoryEntry
 	logPath        string
+	atomHome       string
 	cfg            config.Config
 	wd             string
 	events         chan tea.Msg
@@ -458,10 +460,10 @@ type appModel struct {
 	toast          string
 }
 
-func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionSink *resumableSession, logPath string, cfg config.Config, wd string, agentFiles int) {
+func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionSink *resumableSession, logPath, atomHome string, cfg config.Config, wd string, agentFiles int) {
 	events := make(chan tea.Msg, 64)
 	loop.Observer = uiObserver{events: events}
-	m := appModel{ctx: ctx, loop: loop, skills: skills, session: sessionSink, logPath: logPath, cfg: cfg, wd: wd, events: events, width: 100, height: 30}
+	m := appModel{ctx: ctx, loop: loop, skills: skills, session: sessionSink, logPath: logPath, atomHome: atomHome, cfg: cfg, wd: wd, events: events, width: 100, height: 30}
 	if agentFiles > 0 {
 		m.transcript = append(m.transcript, fmt.Sprintf("Loaded %d AGENTS.md file(s)", agentFiles))
 	}
@@ -482,6 +484,45 @@ func (m appModel) startTurn(text string) tea.Cmd {
 }
 func (m appModel) compact() tea.Cmd {
 	return func() tea.Msg { return turnDone{err: m.loop.Compact(m.ctx)} }
+}
+func (m appModel) update() tea.Cmd {
+	return func() tea.Msg { return updateDone{err: updateAtom(m.atomHome, runUpdateCommand)} }
+}
+
+type updateCommand func(dir, name string, args ...string) error
+
+func updateAtom(dir string, run updateCommand) error {
+	if dir == "" {
+		return fmt.Errorf("Atom home is not configured")
+	}
+	source := filepath.Join(dir, "source")
+	if info, err := os.Stat(source); err != nil || !info.IsDir() {
+		source = dir // Support installations created before the source subdirectory layout.
+	}
+	if err := run(source, "git", "pull", "--ff-only"); err != nil {
+		return fmt.Errorf("pull update: %w", err)
+	}
+	target := filepath.Join(dir, "atom")
+	if runtime.GOOS == "windows" {
+		target += ".exe"
+	}
+	if err := run(source, "go", "build", "-o", target, "./cmd/atom"); err != nil {
+		return fmt.Errorf("build update: %w", err)
+	}
+	return nil
+}
+
+func runUpdateCommand(dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if detail := strings.TrimSpace(string(output)); detail != "" {
+		return fmt.Errorf("%s", detail)
+	}
+	return err
 }
 func (m appModel) loadModels() tea.Cmd {
 	return func() tea.Msg {
@@ -928,6 +969,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.startTurn(next)
 		}
 		return m, nil
+	case updateDone:
+		m.busy = false
+		if msg.err != nil {
+			m.add("update failed: " + msg.err.Error())
+		} else {
+			m.add("Atom updated. Restart Atom to use the new version.")
+		}
+		return m, nil
 	case modelsLoaded:
 		if msg.err != nil {
 			m.add("error: " + msg.err.Error())
@@ -1329,6 +1378,14 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		}
 	case "/logs":
 		m.add(m.logPath)
+	case "/update":
+		if m.busy {
+			m.add("wait for the current turn before updating")
+			return m, nil
+		}
+		m.busy = true
+		m.add("· updating Atom")
+		return m, m.update()
 	case "/skills":
 		if len(m.skills) == 0 {
 			m.add("no skills found")

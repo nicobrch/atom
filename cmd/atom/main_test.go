@@ -58,6 +58,54 @@ func TestCommandMatchesFiltersByTypedPrefix(t *testing.T) {
 	}
 }
 
+func TestUpdateAtomPullsAndRebuildsGlobalInstallation(t *testing.T) {
+	var calls [][]string
+	run := func(dir, name string, args ...string) error {
+		calls = append(calls, append([]string{dir, name}, args...))
+		return nil
+	}
+	if err := updateAtom("/home/user/.atom", run); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"/home/user/.atom", "git", "pull", "--ff-only"},
+		{"/home/user/.atom", "go", "build", "-o", "/home/user/.atom/atom", "./cmd/atom"},
+	}
+	if !slices.EqualFunc(calls, want, func(a, b []string) bool { return slices.Equal(a, b) }) {
+		t.Fatalf("update commands = %q, want %q", calls, want)
+	}
+}
+
+func TestUpdateAtomUsesSourceSubdirectory(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	run := func(dir, name string, args ...string) error {
+		calls = append(calls, append([]string{dir, name}, args...))
+		return nil
+	}
+	if err := updateAtom(home, run); err != nil {
+		t.Fatal(err)
+	}
+	if calls[0][0] != source || calls[1][0] != source || calls[1][4] != filepath.Join(home, "atom") {
+		t.Fatalf("update commands = %q", calls)
+	}
+}
+
+func TestUpdateAtomStopsWhenPullFails(t *testing.T) {
+	calls := 0
+	err := updateAtom("/home/user/.atom", func(string, string, ...string) error {
+		calls++
+		return errors.New("not a git repository")
+	})
+	if err == nil || !strings.Contains(err.Error(), "pull update") || calls != 1 {
+		t.Fatalf("updateAtom() = %v after %d calls", err, calls)
+	}
+}
+
 func TestCommandsDoNotAdvertiseArguments(t *testing.T) {
 	for _, command := range commands {
 		if strings.ContainsAny(command, " <>[]") {
