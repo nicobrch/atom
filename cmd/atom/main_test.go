@@ -419,6 +419,16 @@ func TestHorizontalMenuUsesLeftAndRightArrows(t *testing.T) {
 	}
 }
 
+func TestEmptyLoadingMenuIgnoresNavigation(t *testing.T) {
+	m := appModel{menuKind: "effort-loading"}
+
+	got, _ := m.menuKey(tea.KeyMsg{Type: tea.KeyRight})
+	m = got.(appModel)
+	if m.menuKind != "effort-loading" {
+		t.Fatalf("menu kind = %q, want effort-loading", m.menuKind)
+	}
+}
+
 func TestSelectingModelOpensItsEffortPicker(t *testing.T) {
 	m := appModel{
 		loop:     &agent.Loop{},

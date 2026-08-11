@@ -1114,6 +1114,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if len(m.menu) == 0 {
+		if k.String() == "esc" {
+			m.menuKind = ""
+		}
+		return m, nil
+	}
 	if m.menuKind == "resume" || m.menuKind == "model" {
 		switch k.String() {
 		case "esc":
