@@ -9,9 +9,8 @@ import (
 )
 
 type savedAuth struct {
-	OpenAIAPIKey      string `json:"openai_api_key,omitempty"`
-	CopilotToken      string `json:"copilot_token,omitempty"`
-	CopilotOAuthToken string `json:"copilot_oauth_token,omitempty"`
+	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
+	CopilotToken string `json:"copilot_token,omitempty"`
 }
 
 func authPath() (string, error) {
@@ -78,12 +77,4 @@ func SaveAPIKey(name, key string) error {
 
 func SaveCopilotToken(token string) error {
 	return SaveAPIKey("copilot", token)
-}
-
-func SaveCopilotOAuthToken(token string) error {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return fmt.Errorf("Copilot OAuth token is required")
-	}
-	return saveAuth(func(auth *savedAuth) { auth.CopilotOAuthToken = token })
 }
