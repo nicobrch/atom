@@ -109,6 +109,38 @@ func Home() (string, error) {
 
 func Save(workdir string, cfg Config) error {
 	path := filepath.Join(workdir, ".atom", "config.json")
+	return save(path, cfg)
+}
+
+// SaveGlobal stores user defaults shared by every workspace.
+func SaveGlobal(cfg Config) error {
+	home, err := Home()
+	if err != nil {
+		return err
+	}
+	return save(filepath.Join(home, "config.json"), cfg)
+}
+
+// MigrateLocalConfig imports settings written by Atom before global defaults
+// existed. It never overwrites an existing global configuration.
+func MigrateLocalConfig(workdir string, cfg Config) error {
+	home, err := Home()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(home, "config.json")); err == nil || !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(workdir, ".atom", "config.json")); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return SaveGlobal(cfg)
+}
+
+func save(path string, cfg Config) error {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err

@@ -120,6 +120,9 @@ func main() {
 	if err != nil {
 		fatal(err.Error())
 	}
+	if err := config.MigrateLocalConfig(wd, cfg); err != nil {
+		fatal(err.Error())
+	}
 	if providerName != "" {
 		cfg.Provider = providerName
 	}
@@ -1036,6 +1039,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			p.SetTools(m.loop.Tools)
 		}
 		m.loop.Provider, m.cfg.Provider = p, msg.provider
+		if err := config.SaveGlobal(m.cfg); err != nil {
+			m.add("error saving provider: " + err.Error())
+		}
 		// A provider's model set is credential-specific. Always make the user
 		// choose one after login instead of inheriting a guessed default model.
 		m.loop.Model, m.cfg.Model = "", ""
@@ -1169,7 +1175,7 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.menuKind == "effort" {
 			m.loop.ReasoningEffort, m.cfg.Effort = id, id
 			m.menuKind, m.menu = "", nil
-			if err := config.Save(m.wd, m.cfg); err != nil {
+			if err := config.SaveGlobal(m.cfg); err != nil {
 				m.add("error saving settings: " + err.Error())
 			} else {
 				m.add("effort set: " + id)
@@ -1191,7 +1197,7 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		for _, model := range m.models {
 			if model.ID == id {
 				m.loop.Model, m.cfg.Model = id, id
-				if err := config.Save(m.wd, m.cfg); err != nil {
+				if err := config.SaveGlobal(m.cfg); err != nil {
 					m.add("error saving settings: " + err.Error())
 				} else {
 					m.add("model set: " + id)

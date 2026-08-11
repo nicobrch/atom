@@ -29,6 +29,9 @@ Atom starts without a selected provider or model. Use `/login` in the app (or
 `atom login openai` / `atom login copilot`) and then select one of the models
 available to that account before starting a conversation.
 
+Provider and model choices are saved in `~/.atom/config.json` and apply in
+every folder. A project's `.atom/config.json` can override those defaults.
+
 ## Documentation
 
 - [Documentation](docs/README.md)

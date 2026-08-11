@@ -50,3 +50,24 @@ func TestLoadMergesGlobalThenProjectConfiguration(t *testing.T) {
 		t.Fatalf("merged config = %#v", cfg)
 	}
 }
+
+func TestMigrateLocalConfigImportsLegacyDefaultsOnce(t *testing.T) {
+	dir := t.TempDir()
+	global := filepath.Join(dir, "global")
+	t.Setenv("ATOM_HOME", global)
+	if err := os.MkdirAll(filepath.Join(dir, ".atom"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := Defaults()
+	legacy.Provider, legacy.Model = "copilot", "gpt-5.6-luna"
+	if err := Save(dir, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLocalConfig(dir, legacy); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(t.TempDir())
+	if err != nil || got.Provider != legacy.Provider || got.Model != legacy.Model {
+		t.Fatalf("global config = %#v, err = %v", got, err)
+	}
+}
