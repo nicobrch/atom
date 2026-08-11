@@ -39,7 +39,7 @@ func New(workdir string) (*JSONL, error) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		return nil, err
 	}
-	return Open(filepath.Join(dir, time.Now().Format("20060102-150405")+".jsonl"))
+	return Open(filepath.Join(dir, time.Now().Format("20060102-150405.000000000")+".jsonl"))
 }
 
 func Open(path string) (*JSONL, error) {
@@ -80,30 +80,62 @@ func LoadMessages(path string) ([]agent.Message, error) {
 		return nil, err
 	}
 	defer f.Close()
+	allowPartialLast := false
+	if info, statErr := f.Stat(); statErr == nil && info.Size() > 0 {
+		last := []byte{0}
+		if _, readErr := f.ReadAt(last, info.Size()-1); readErr == nil {
+			allowPartialLast = last[0] != '\n'
+		}
+	}
 	var messages []agent.Message
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for sc.Scan() {
+	var pending []byte
+	load := func(line []byte) error {
 		var r Record
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			return nil, fmt.Errorf("invalid session record: %w", err)
+		if err := json.Unmarshal(line, &r); err != nil {
+			return fmt.Errorf("invalid session record: %w", err)
 		}
 		switch r.Type {
+		case "clear":
+			messages = nil
 		case "message":
 			var m agent.Message
 			if err := json.Unmarshal(r.Data, &m); err != nil {
-				return nil, err
+				return err
 			}
 			messages = append(messages, m)
 		case "compaction":
 			var summary agent.Message
 			if err := json.Unmarshal(r.Data, &summary); err != nil {
-				return nil, err
+				return err
 			}
 			messages = []agent.Message{summary}
 		}
+		return nil
 	}
-	return messages, sc.Err()
+	for sc.Scan() {
+		if pending != nil {
+			if err := load(pending); err != nil {
+				return nil, err
+			}
+		}
+		pending = append(pending[:0], sc.Bytes()...)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(pending) > 0 {
+		if err := load(pending); err != nil {
+			// Crash during append can leave one partial final JSON object. Earlier
+			// records remain durable and sufficient to resume.
+			if allowPartialLast {
+				return messages, nil
+			}
+			return nil, err
+		}
+	}
+	return messages, nil
 }
 
 // History returns workspace sessions from newest to oldest. A short preview of

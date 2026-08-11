@@ -9,10 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nicobrch/atom/internal/agent"
@@ -22,13 +21,18 @@ import (
 // this adapter wire-compatible makes the provider seam useful for OpenAI,
 // Copilot, and private gateways without pulling an SDK into Atom.
 type OpenAICompatible struct {
-	ProviderName string
-	BaseURL      string
-	Token        string
-	Headers      map[string]string
-	Client       *http.Client
-	Responses    bool
-	AccountID    string
+	ProviderName   string
+	BaseURL        string
+	Token          string
+	Headers        map[string]string
+	Client         *http.Client
+	Responses      bool
+	AccountID      string
+	Refresh        func(context.Context) error
+	authMu         sync.Mutex
+	modelMu        sync.RWMutex
+	models         []Model
+	responseModels map[string]bool
 }
 
 type Model struct {
@@ -39,11 +43,22 @@ type Model struct {
 	ContextTokens int
 }
 
-// Models returns models granted to this exact credential. ChatGPT accounts use
-// Codex's own account-aware catalog; API and Copilot credentials ask their API.
+// Models returns provider choices. ChatGPT uses Atom's release-bundled Codex
+// catalog; API and Copilot credentials ask their API.
 func (p *OpenAICompatible) Models(ctx context.Context) ([]Model, error) {
+	if !p.Responses {
+		p.modelMu.RLock()
+		cached := append([]Model(nil), p.models...)
+		p.modelMu.RUnlock()
+		if len(cached) > 0 {
+			return cached, nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	if err := p.refreshAuth(ctx); err != nil {
+		return nil, err
+	}
 	if p.Responses {
 		return codexModels(ctx)
 	}
@@ -80,6 +95,7 @@ func (p *OpenAICompatible) Models(ctx context.Context) ([]Model, error) {
 			Capabilities struct {
 				Supports struct {
 					ReasoningEffort []string `json:"reasoning_effort"`
+					ToolCalls       *bool    `json:"tool_calls"`
 				} `json:"supports"`
 				Limits struct {
 					ContextWindow          int `json:"context_window"`
@@ -102,64 +118,61 @@ func (p *OpenAICompatible) Models(ctx context.Context) ([]Model, error) {
 		return nil, fmt.Errorf("decode models: %w", err)
 	}
 	models := make([]Model, 0, len(data.Data))
+	policyModels := make([]Model, 0, len(data.Data))
+	responseModels := map[string]bool{}
 	for _, item := range data.Data {
 		if item.ID == "" || item.Policy.State == "disabled" {
 			continue
 		}
-		if p.ProviderName == "copilot" && (!item.ModelPickerEnabled || (len(item.SupportedEndpoints) > 0 && !contains(item.SupportedEndpoints, "/chat/completions"))) {
-			continue
-		}
-		models = append(models, Model{ID: item.ID, Name: item.Name, Efforts: item.Capabilities.Supports.ReasoningEffort, ContextTokens: firstPositive(
+		model := Model{ID: item.ID, Name: item.Name, Efforts: item.Capabilities.Supports.ReasoningEffort, ContextTokens: firstPositive(
 			item.ContextWindow, item.ContextLength, item.MaxContextTokens, item.MaxContextLength, item.ContextWindowTokens, item.MaxContextWindowTokens,
 			item.Capabilities.Limits.ContextWindow, item.Capabilities.Limits.ContextLength, item.Capabilities.Limits.MaxContextTokens, item.Capabilities.Limits.MaxContextLength, item.Capabilities.Limits.ContextWindowTokens, item.Capabilities.Limits.MaxContextWindowTokens,
-		)})
+		)}
+		if p.ProviderName != "copilot" {
+			models = append(models, model)
+			continue
+		}
+		if len(item.SupportedEndpoints) > 0 && !contains(item.SupportedEndpoints, "/chat/completions") && !contains(item.SupportedEndpoints, "/responses") {
+			continue
+		}
+		if item.Capabilities.Supports.ToolCalls != nil && !*item.Capabilities.Supports.ToolCalls {
+			continue
+		}
+		if item.ModelPickerEnabled {
+			models = append(models, model)
+			responseModels[item.ID] = contains(item.SupportedEndpoints, "/responses")
+		}
+		if item.Policy.State == "enabled" {
+			policyModels = append(policyModels, model)
+			if _, exists := responseModels[item.ID]; !exists {
+				responseModels[item.ID] = contains(item.SupportedEndpoints, "/responses")
+			}
+		}
+	}
+	if p.ProviderName == "copilot" && len(models) == 0 && p.BaseURL == "https://api.individual.githubcopilot.com" {
+		models = policyModels
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	if len(models) == 0 {
 		return nil, fmt.Errorf("no selectable models available for %s", p.ProviderName)
 	}
+	p.modelMu.Lock()
+	p.models = append([]Model(nil), models...)
+	p.responseModels = responseModels
+	p.modelMu.Unlock()
 	return models, nil
 }
 
-func codexModels(ctx context.Context) ([]Model, error) {
-	output, err := exec.CommandContext(ctx, "codex", "debug", "models").Output()
-	if err != nil {
-		return nil, fmt.Errorf("read ChatGPT models with Codex: %w", err)
-	}
-	var catalog struct {
-		Models []struct {
-			Slug             string `json:"slug"`
-			DisplayName      string `json:"display_name"`
-			Visibility       string `json:"visibility"`
-			SupportedInAPI   bool   `json:"supported_in_api"`
-			DefaultEffort    string `json:"default_reasoning_level"`
-			ContextWindow    int    `json:"context_window"`
-			ContextLength    int    `json:"context_length"`
-			MaxContextTokens int    `json:"max_context_tokens"`
-			Efforts          []struct {
-				Effort string `json:"effort"`
-			} `json:"supported_reasoning_levels"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(output, &catalog); err != nil {
-		return nil, fmt.Errorf("decode ChatGPT models: %w", err)
-	}
-	models := make([]Model, 0, len(catalog.Models))
-	for _, item := range catalog.Models {
-		if item.Slug != "" && item.Visibility == "list" && item.SupportedInAPI {
-			efforts := make([]string, 0, len(item.Efforts))
-			for _, effort := range item.Efforts {
-				if effort.Effort != "" {
-					efforts = append(efforts, effort.Effort)
-				}
-			}
-			models = append(models, Model{ID: item.Slug, Name: item.DisplayName, Efforts: efforts, DefaultEffort: item.DefaultEffort, ContextTokens: firstPositive(item.ContextWindow, item.ContextLength, item.MaxContextTokens)})
-		}
-	}
-	if len(models) == 0 {
-		return nil, fmt.Errorf("no models available for this ChatGPT account")
-	}
-	return models, nil
+func codexModels(context.Context) ([]Model, error) {
+	allEfforts := []string{"low", "medium", "high", "xhigh", "max", "ultra"}
+	return []Model{
+		{ID: "gpt-5.6-sol", Name: "GPT-5.6-Sol", DefaultEffort: "low", Efforts: allEfforts, ContextTokens: 272000},
+		{ID: "gpt-5.6-terra", Name: "GPT-5.6-Terra", DefaultEffort: "medium", Efforts: allEfforts, ContextTokens: 272000},
+		{ID: "gpt-5.6-luna", Name: "GPT-5.6-Luna", DefaultEffort: "medium", Efforts: allEfforts[:5], ContextTokens: 272000},
+		{ID: "gpt-5.5", Name: "GPT-5.5", DefaultEffort: "medium", Efforts: allEfforts[:4], ContextTokens: 272000},
+		{ID: "gpt-5.4", Name: "GPT-5.4", DefaultEffort: "medium", Efforts: allEfforts[:4], ContextTokens: 272000},
+		{ID: "gpt-5.4-mini", Name: "GPT-5.4-Mini", DefaultEffort: "medium", Efforts: allEfforts[:4], ContextTokens: 272000},
+	}, nil
 }
 
 func firstPositive(values ...int) int {
@@ -188,8 +201,28 @@ func OpenAIFromEnv() (*OpenAICompatible, error) {
 	if saved.OpenAIAPIKey != "" {
 		return &OpenAICompatible{ProviderName: "openai", BaseURL: "https://api.openai.com/v1", Token: saved.OpenAIAPIKey}, nil
 	}
-	if subscription, err := codexSubscription(); err == nil {
-		return subscription, nil
+	if saved.OpenAIOAuth != nil {
+		credential := *saved.OpenAIOAuth
+		p := &OpenAICompatible{ProviderName: "openai", BaseURL: codexResponsesURL, Responses: true}
+		p.Refresh = func(ctx context.Context) error {
+			if credential.Access != "" && time.Until(time.UnixMilli(credential.Expires)) > 5*time.Minute {
+				p.Token, p.AccountID = credential.Access, credential.AccountID
+				return nil
+			}
+			refreshed, err := refreshOpenAIToken(ctx, http.DefaultClient, openAITokenURL, credential.Refresh)
+			if err != nil {
+				return err
+			}
+			credential = refreshed
+			p.Token, p.AccountID = credential.Access, credential.AccountID
+			return saveOpenAIOAuth(credential)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := p.refreshAuth(ctx); err != nil {
+			return nil, err
+		}
+		return p, nil
 	}
 	token, err := OpenAIKey()
 	if err != nil {
@@ -202,72 +235,11 @@ func OpenAIFromEnv() (*OpenAICompatible, error) {
 	return &OpenAICompatible{ProviderName: "openai", BaseURL: base, Token: token}, nil
 }
 
-func codexSubscription() (*OpenAICompatible, error) {
-	home := os.Getenv("CODEX_HOME")
-	if home == "" {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		home = filepath.Join(userHome, ".codex")
-	}
-	b, err := os.ReadFile(filepath.Join(home, "auth.json"))
-	if err != nil {
-		return nil, err
-	}
-	var auth struct {
-		AuthMode string `json:"auth_mode"`
-		Tokens   struct {
-			AccessToken string `json:"access_token"`
-			AccountID   string `json:"account_id"`
-		} `json:"tokens"`
-	}
-	if err := json.Unmarshal(b, &auth); err != nil {
-		return nil, err
-	}
-	if auth.AuthMode != "chatgpt" || strings.TrimSpace(auth.Tokens.AccessToken) == "" {
-		return nil, fmt.Errorf("Codex ChatGPT subscription not found")
-	}
-	return &OpenAICompatible{ProviderName: "openai", BaseURL: codexResponsesURL, Token: auth.Tokens.AccessToken, AccountID: auth.Tokens.AccountID, Responses: true}, nil
-}
-
-// OpenAIKey first honors the explicit API-key environment variable. When it is
-// absent, it reuses the API-style credential created by Codex's supported
-// "Sign in with ChatGPT" flow. Atom never copies that credential or writes it
-// to a project file; it is read only for the request being made.
 func OpenAIKey() (string, error) {
 	if token := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); token != "" {
 		return token, nil
 	}
-	home := os.Getenv("CODEX_HOME")
-	if home == "" {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		home = filepath.Join(userHome, ".codex")
-	}
-	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("OpenAI credentials not found: set OPENAI_API_KEY or run `atom auth openai`")
-		}
-		return "", fmt.Errorf("read Codex credentials: %w", err)
-	}
-	var auth struct {
-		APIKey string `json:"OPENAI_API_KEY"`
-	}
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return "", fmt.Errorf("parse Codex credentials: %w", err)
-	}
-	if token := strings.TrimSpace(auth.APIKey); token != "" {
-		return token, nil
-	}
-	return "", fmt.Errorf("Codex is signed in but no reusable API credential is available; run `codex --login` again or set OPENAI_API_KEY")
-}
-
-func CopilotFromEnv() (agent.Provider, error) {
-	return NewCopilotSDK(""), nil
+	return "", fmt.Errorf("OpenAI credentials not found: set OPENAI_API_KEY or run `atom login openai`")
 }
 
 func (p *OpenAICompatible) Name() string { return p.ProviderName }
@@ -310,7 +282,15 @@ type toolFunction struct {
 }
 
 func (p *OpenAICompatible) Stream(ctx context.Context, req agent.Request) (<-chan agent.StreamEvent, <-chan error) {
-	if p.Responses {
+	if err := p.refreshAuth(ctx); err != nil {
+		events := make(chan agent.StreamEvent)
+		errs := make(chan error, 1)
+		close(events)
+		errs <- providerFailure("authenticate", err)
+		close(errs)
+		return events, errs
+	}
+	if p.Responses || p.usesResponses(req.Model) {
 		return p.streamResponses(ctx, req)
 	}
 	events := make(chan agent.StreamEvent)
@@ -376,6 +356,21 @@ func (p *OpenAICompatible) Stream(ctx context.Context, req agent.Request) (<-cha
 		}
 	}()
 	return events, errs
+}
+
+func (p *OpenAICompatible) usesResponses(model string) bool {
+	p.modelMu.RLock()
+	defer p.modelMu.RUnlock()
+	return p.responseModels[model]
+}
+
+func (p *OpenAICompatible) refreshAuth(ctx context.Context) error {
+	if p.Refresh == nil {
+		return nil
+	}
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	return p.Refresh(ctx)
 }
 
 type chatChunk struct {

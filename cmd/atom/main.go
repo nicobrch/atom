@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
 
 	"github.com/nicobrch/atom/internal/agent"
 	"github.com/nicobrch/atom/internal/config"
@@ -26,7 +28,7 @@ import (
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 const headerPadding = 1
 const composerPadding = 1
 
@@ -59,7 +61,7 @@ func (t *terminal) ToolStart(c agent.ToolCall) {
 	if t.assistantOpen || t.toolLineOpen {
 		fmt.Fprintln(t.out)
 	}
-	fmt.Fprintf(t.out, "\033[2m└─\033[0m \033[36m%s\033[0m ", c.Name)
+	fmt.Fprintf(t.out, "\033[2m└─\033[0m \033[36m%s\033[0m ", toolCallLabel(c))
 	t.assistantOpen, t.toolLineOpen = false, true
 }
 func (t *terminal) ToolEnd(_ agent.ToolCall, output string, err error) {
@@ -94,11 +96,13 @@ func main() {
 		return
 	}
 	var providerName, model, prompt, sessionPath string
-	var printMode, showVersion bool
+	var printMode, jsonMode, listModels, showVersion bool
 	flag.StringVar(&providerName, "provider", "", "provider: openai or copilot")
 	flag.StringVar(&model, "model", "", "model identifier")
 	flag.StringVar(&prompt, "p", "", "run one prompt and exit")
 	flag.BoolVar(&printMode, "print", false, "plain output in interactive-disabled mode")
+	flag.BoolVar(&jsonMode, "json", false, "JSONL events in interactive-disabled mode")
+	flag.BoolVar(&listModels, "list-models", false, "list authenticated provider models and exit")
 	flag.StringVar(&sessionPath, "session", "", "resume or append to a JSONL session")
 	flag.BoolVar(&showVersion, "version", false, "print version")
 	flag.Parse()
@@ -109,8 +113,11 @@ func main() {
 	if prompt == "" && flag.NArg() > 0 {
 		prompt = strings.Join(flag.Args(), " ")
 	}
-	if printMode && prompt == "" {
-		fatal("--print requires a prompt")
+	if printMode && jsonMode {
+		fatal("--print and --json are mutually exclusive")
+	}
+	if (printMode || jsonMode) && prompt == "" {
+		fatal("--print and --json require a prompt")
 	}
 	wd, err := os.Getwd()
 	if err != nil {
@@ -131,10 +138,25 @@ func main() {
 	}
 	p, err := selectProvider(cfg.Provider)
 	if err != nil {
-		if prompt != "" {
+		if prompt != "" || listModels {
 			fatal(err.Error())
 		}
 		p = unavailableProvider{err}
+	}
+	if listModels {
+		models, modelErr := availableModels(context.Background(), p)
+		if modelErr != nil {
+			fatal(modelErr.Error())
+		}
+		for _, available := range models {
+			fmt.Printf("%s\t%s\n", available.ID, available.Name)
+		}
+		return
+	}
+	if prompt != "" && cfg.Model != "" {
+		if models, modelErr := availableModels(context.Background(), p); modelErr == nil {
+			cfg.Effort = normalizedEffort(cfg.Model, cfg.Effort, models)
+		}
 	}
 	atomHome, err := config.Home()
 	if err != nil {
@@ -171,19 +193,18 @@ func main() {
 	}
 	defer logStore.Close()
 	var obs agent.Observer
-	if printMode {
+	if jsonMode {
+		obs = &jsonObserver{encoder: json.NewEncoder(os.Stdout)}
+	} else if printMode {
 		obs = &plain{out: os.Stdout}
 	} else {
 		obs = &terminal{out: os.Stdout}
 	}
 	agentTools := toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second))
 	agentTools = append(agentTools, skillTool{skills: skills})
-	if p, ok := p.(interface{ SetTools([]agent.Tool) }); ok {
-		p.SetTools(agentTools)
-	}
 	sessionSink := &resumableSession{store: store}
 	defer sessionSink.Close()
-	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: agentTools, System: system, Sink: sessionSink, Diagnostics: logStore, Observer: obs}
+	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, AutoCompactAt: cfg.AutoCompactAt, Tools: agentTools, System: system, Sink: sessionSink, Diagnostics: logStore, Observer: obs}
 	if sessionPath != "" {
 		messages, e := session.LoadMessages(sessionPath)
 		if e != nil {
@@ -194,7 +215,13 @@ func main() {
 	ctx := context.Background()
 	if prompt != "" {
 		if err := loop.Prompt(ctx, prompt); err != nil {
+			if jsonMode {
+				obs.(*jsonObserver).emit(map[string]any{"type": "error", "error": err.Error()})
+			}
 			fatal(err.Error())
+		}
+		if jsonMode {
+			obs.(*jsonObserver).emit(map[string]any{"type": "result", "input_tokens": loop.InputTokens, "output_tokens": loop.OutputTokens, "session": store.Path()})
 		}
 		return
 	}
@@ -212,9 +239,20 @@ func runLogin(args []string) {
 	}
 	if method == "api" {
 		fmt.Fprint(os.Stderr, "API key: ")
-		key, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil && len(key) == 0 {
-			fatal(err.Error())
+		var key string
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			value, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Fprintln(os.Stderr)
+			if err != nil {
+				fatal(err.Error())
+			}
+			key = string(value)
+		} else {
+			value, err := bufio.NewReader(os.Stdin).ReadString('\n')
+			if err != nil && len(value) == 0 {
+				fatal(err.Error())
+			}
+			key = value
 		}
 		if err := provider.SaveAPIKey(name, key); err != nil {
 			fatal(err.Error())
@@ -231,29 +269,29 @@ func loginSubscription(name, method string) error {
 	if method != "subscription" {
 		return fmt.Errorf("login method must be subscription or api")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 16*time.Minute)
+	defer cancel()
 	switch name {
 	case "openai":
-		cmd := exec.Command("codex", "login")
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("Codex sign-in failed: %w", err)
-		}
-		p, err := provider.OpenAIFromEnv()
-		if err != nil || !p.Responses {
-			return fmt.Errorf("Codex sign-in completed, but Atom cannot use ChatGPT subscription credentials")
-		}
-		fmt.Println("ChatGPT subscription available to Atom.")
-	case "copilot", "github-copilot":
-		path, err := provider.CopilotCLIPath()
+		code, err := provider.StartOpenAILogin(ctx)
 		if err != nil {
 			return err
 		}
-		cmd := exec.Command(path, "login")
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("Copilot CLI sign-in failed: %w", err)
+		fmt.Printf("Open %s and enter code %s\n", "https://auth.openai.com/codex/device", code.UserCode)
+		if err := provider.FinishOpenAILogin(ctx, code); err != nil {
+			return err
 		}
-		fmt.Println("GitHub Copilot CLI subscription available to Atom.")
+		fmt.Println("ChatGPT subscription available to Atom.")
+	case "copilot", "github-copilot":
+		code, err := provider.StartCopilotLogin(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Open %s and enter code %s\n", code.VerificationURI, code.UserCode)
+		if err := provider.FinishCopilotLogin(ctx, code); err != nil {
+			return err
+		}
+		fmt.Println("GitHub Copilot subscription available to Atom.")
 	default:
 		return fmt.Errorf("usage: atom login <openai|copilot> [subscription|api]")
 	}
@@ -332,8 +370,28 @@ func (p *plain) ToolStart(agent.ToolCall)                    {}
 func (p *plain) ToolEnd(_ agent.ToolCall, _ string, _ error) {}
 func (p *plain) Status(string)                               {}
 
+type jsonObserver struct{ encoder *json.Encoder }
+
+func (o *jsonObserver) emit(event map[string]any) { _ = o.encoder.Encode(event) }
+func (o *jsonObserver) Text(delta string) {
+	o.emit(map[string]any{"type": "text_delta", "delta": delta})
+}
+func (o *jsonObserver) ToolStart(call agent.ToolCall) {
+	o.emit(map[string]any{"type": "tool_start", "call": call})
+}
+func (o *jsonObserver) ToolEnd(call agent.ToolCall, output string, err error) {
+	event := map[string]any{"type": "tool_end", "call": call, "output": output}
+	if err != nil {
+		event["error"] = err.Error()
+	}
+	o.emit(event)
+}
+func (o *jsonObserver) Status(status string) {
+	o.emit(map[string]any{"type": "status", "status": status})
+}
+
 var commands = []string{
-	"/clear", "/compact", "/exit", "/help", "/login", "/effort", "/logs",
+	"/clear", "/clone", "/compact", "/exit", "/help", "/login", "/effort", "/logs", "/new",
 	"/model", "/resume", "/session", "/skill", "/skills", "/update",
 }
 
@@ -358,16 +416,46 @@ func (s *resumableSession) Resume(path string) ([]agent.Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.replace(next); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (s *resumableSession) New(workdir string) error {
+	next, err := session.New(workdir)
+	if err != nil {
+		return err
+	}
+	return s.replace(next)
+}
+
+func (s *resumableSession) Clone(workdir string, messages []agent.Message) error {
+	next, err := session.New(workdir)
+	if err != nil {
+		return err
+	}
+	for _, message := range messages {
+		if err := next.WriteEvent("message", message); err != nil {
+			next.Close()
+			_ = os.Remove(next.Path())
+			return err
+		}
+	}
+	return s.replace(next)
+}
+
+func (s *resumableSession) replace(next *session.JSONL) error {
 	previous := s.store
 	if err := previous.Close(); err != nil {
 		next.Close()
-		return nil, err
+		return err
 	}
 	if info, err := os.Stat(previous.Path()); err == nil && info.Size() == 0 {
 		_ = os.Remove(previous.Path())
 	}
 	s.store = next
-	return messages, nil
+	return nil
 }
 
 func commandName(command string) string { return strings.Fields(command)[0] }
@@ -397,9 +485,28 @@ func availableModels(ctx context.Context, p agent.Provider) ([]provider.Model, e
 	return lister.Models(ctx)
 }
 
+func normalizedEffort(modelID, effort string, models []provider.Model) string {
+	for _, model := range models {
+		if model.ID != modelID {
+			continue
+		}
+		for _, supported := range model.Efforts {
+			if supported == effort {
+				return effort
+			}
+		}
+		if effort != "" {
+			return model.DefaultEffort
+		}
+		return ""
+	}
+	return ""
+}
+
 type uiText string
 type uiStatus string
 type uiTool struct{ name, output string }
+type uiSteered int
 type turnDone struct{ err error }
 type modelsLoaded struct {
 	models []provider.Model
@@ -419,9 +526,9 @@ type uiObserver struct{ events chan<- tea.Msg }
 
 func (o uiObserver) Text(s string)              { o.events <- uiText(s) }
 func (o uiObserver) Status(s string)            { o.events <- uiStatus(s) }
-func (o uiObserver) ToolStart(c agent.ToolCall) { o.events <- uiTool{name: c.Name} }
+func (o uiObserver) ToolStart(c agent.ToolCall) { o.events <- uiTool{name: toolCallLabel(c)} }
 func (o uiObserver) ToolEnd(_ agent.ToolCall, out string, err error) {
-	if err != nil {
+	if err != nil && strings.TrimSpace(out) == "" {
 		out = "error: " + err.Error()
 	}
 	one := strings.ReplaceAll(strings.TrimSpace(out), "\n", " ")
@@ -429,6 +536,28 @@ func (o uiObserver) ToolEnd(_ agent.ToolCall, out string, err error) {
 		one = one[:140] + "…"
 	}
 	o.events <- uiTool{output: one}
+}
+
+func toolCallLabel(call agent.ToolCall) string {
+	var args struct {
+		Path    string `json:"path"`
+		Command string `json:"command"`
+		Pattern string `json:"pattern"`
+		Name    string `json:"name"`
+	}
+	_ = json.Unmarshal(call.Arguments, &args)
+	detail := map[string]string{
+		"bash": args.Command, "read": args.Path, "write": args.Path,
+		"edit": args.Path, "grep": args.Pattern, "load_skill": args.Name,
+	}[call.Name]
+	detail = strings.Join(strings.Fields(detail), " ")
+	if runes := []rune(detail); len(runes) > 140 {
+		detail = string(runes[:140]) + "…"
+	}
+	if detail == "" {
+		return call.Name
+	}
+	return call.Name + "  " + detail
 }
 
 type appModel struct {
@@ -448,6 +577,7 @@ type appModel struct {
 	draggingInput  bool
 	transcript     []string
 	queue          []string
+	followUps      []string
 	busy           bool
 	width          int
 	height         int
@@ -465,12 +595,33 @@ type appModel struct {
 	selectionFrom  mousePoint
 	selectionTo    mousePoint
 	toast          string
+	turnCancel     context.CancelFunc
+	steering       chan string
+	history        []string
+	historyPos     int
+	historyDraft   string
 }
 
 func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionSink *resumableSession, logPath, atomHome string, cfg config.Config, wd string, agentFiles int) {
 	events := make(chan tea.Msg, 64)
+	steering := make(chan string, 64)
+	loop.Steering = func() []string {
+		var messages []string
+		for {
+			select {
+			case message := <-steering:
+				messages = append(messages, message)
+			default:
+				if len(messages) > 0 {
+					events <- uiSteered(len(messages))
+				}
+				return messages
+			}
+		}
+	}
 	loop.Observer = uiObserver{events: events}
-	m := appModel{ctx: ctx, loop: loop, skills: skills, session: sessionSink, logPath: logPath, atomHome: atomHome, cfg: cfg, wd: wd, events: events, width: 100, height: 30}
+	history := promptHistory(loop.Messages)
+	m := appModel{ctx: ctx, loop: loop, skills: skills, session: sessionSink, logPath: logPath, atomHome: atomHome, cfg: cfg, wd: wd, events: events, steering: steering, history: history, historyPos: len(history), width: 100, height: 30}
 	if agentFiles > 0 {
 		m.transcript = append(m.transcript, fmt.Sprintf("Loaded %d AGENTS.md file(s)", agentFiles))
 	}
@@ -490,14 +641,26 @@ func (m appModel) Init() tea.Cmd {
 func waitEvent(events <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg { return <-events }
 }
-func (m appModel) startTurn(text string) tea.Cmd {
+func (m *appModel) startTurn(text string) tea.Cmd {
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.turnCancel = cancel
 	return func() tea.Msg {
-		err := m.loop.Prompt(m.ctx, text)
+		err := m.loop.Prompt(ctx, text)
 		return turnDone{err: err}
 	}
 }
-func (m appModel) compact() tea.Cmd {
-	return func() tea.Msg { return turnDone{err: m.loop.Compact(m.ctx)} }
+func (m *appModel) compact() tea.Cmd {
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.turnCancel = cancel
+	return func() tea.Msg { return turnDone{err: m.loop.Compact(ctx)} }
 }
 func (m appModel) update() tea.Cmd {
 	return func() tea.Msg { return updateDone{err: updateAtom(m.atomHome, runUpdateCommand)} }
@@ -515,9 +678,6 @@ func updateAtom(dir string, run updateCommand) error {
 	}
 	if err := run(source, "git", "pull", "--ff-only"); err != nil {
 		return fmt.Errorf("pull update: %w", err)
-	}
-	if err := run(source, "go", "tool", "bundler", "-output", "cmd/atom"); err != nil {
-		return fmt.Errorf("bundle Copilot CLI: %w", err)
 	}
 	target := filepath.Join(dir, "atom")
 	if runtime.GOOS == "windows" {
@@ -963,6 +1123,13 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.transcript[len(m.transcript)-1] += "  " + msg.output
 		}
 		return m, waitEvent(m.events)
+	case uiSteered:
+		count := int(msg)
+		if count > len(m.queue) {
+			count = len(m.queue)
+		}
+		m.queue = m.queue[count:]
+		return m, waitEvent(m.events)
 	case thinkingTick:
 		if m.thinking {
 			m.thinkingFrame = (m.thinkingFrame + 1) % len(workingFrames)
@@ -973,17 +1140,40 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.toast = ""
 		return m, nil
 	case turnDone:
+		if m.turnCancel != nil {
+			m.turnCancel()
+			m.turnCancel = nil
+		}
 		m.busy = false
 		m.thinking = false
-		if msg.err != nil {
+		if errors.Is(msg.err, context.Canceled) {
+			m.add("turn cancelled")
+		} else if msg.err != nil {
 			m.add("error: " + msg.err.Error())
 		}
 		if len(m.queue) > 0 {
+			if m.steering != nil {
+				for {
+					select {
+					case <-m.steering:
+					default:
+						goto steeringDrained
+					}
+				}
+			}
+		steeringDrained:
 			next := m.queue[0]
 			m.queue = m.queue[1:]
 			m.busy = true
-			m.add("› " + next)
-			return m, m.startTurn(next)
+			cmd := (&m).startTurn(next)
+			return m, cmd
+		}
+		if len(m.followUps) > 0 {
+			next := m.followUps[0]
+			m.followUps = m.followUps[1:]
+			m.busy = true
+			cmd := (&m).startTurn(next)
+			return m, cmd
 		}
 		return m, nil
 	case updateDone:
@@ -1002,6 +1192,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.models = msg.models
+		m.loop.ReasoningEffort = normalizedEffort(m.loop.Model, m.loop.ReasoningEffort, m.models)
+		m.cfg.Effort = m.loop.ReasoningEffort
+		for _, model := range m.models {
+			if model.ID == m.loop.Model {
+				m.loop.ContextTokens = model.ContextTokens
+				break
+			}
+		}
 		if m.menuKind == "effort-loading" {
 			for _, model := range m.models {
 				if model.ID == m.loop.Model {
@@ -1034,9 +1232,6 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.add("login failed: " + err.Error())
 			return m, nil
-		}
-		if p, ok := p.(interface{ SetTools([]agent.Tool) }); ok {
-			p.SetTools(m.loop.Tools)
 		}
 		m.loop.Provider, m.cfg.Provider = p, msg.provider
 		if err := config.SaveGlobal(m.cfg); err != nil {
@@ -1163,6 +1358,8 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.loop.Messages = messages
+			m.history = promptHistory(messages)
+			m.historyPos = len(m.history)
 			m.transcript = transcriptForMessages(messages)
 			m.add("· resumed session: " + entry.Path)
 			m.scroll = 0
@@ -1203,6 +1400,9 @@ func (m appModel) menuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		for _, model := range m.models {
 			if model.ID == id {
 				m.loop.Model, m.cfg.Model = id, id
+				m.loop.ContextTokens = model.ContextTokens
+				m.loop.ReasoningEffort = normalizedEffort(id, m.loop.ReasoningEffort, m.models)
+				m.cfg.Effort = m.loop.ReasoningEffort
 				if err := config.SaveGlobal(m.cfg); err != nil {
 					m.add("error saving settings: " + err.Error())
 				} else {
@@ -1260,7 +1460,7 @@ func transcriptForMessages(messages []agent.Message) []string {
 				lines = append(lines, message.Content)
 			}
 			for _, call := range message.ToolCalls {
-				lines = append(lines, "└─ "+call.Name)
+				lines = append(lines, "└─ "+toolCallLabel(call))
 			}
 		case "tool":
 			if message.Content != "" {
@@ -1279,7 +1479,17 @@ func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.clampInputCursor()
 	switch k.String() {
 	case "ctrl+c":
+		if m.busy && m.turnCancel != nil {
+			m.turnCancel()
+			m.add("· cancelling turn")
+			return m, nil
+		}
 		return m, tea.Quit
+	case "esc":
+		if m.busy && m.turnCancel != nil {
+			m.turnCancel()
+			m.add("· cancelling turn")
+		}
 	case "left":
 		m.moveInputCursor(m.inputCursor-1, false)
 	case "right":
@@ -1316,13 +1526,10 @@ func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.selected = (m.selected + 1) % len(matches)
 			}
-		} else if m.input == "" {
-			if k.String() == "up" || k.String() == "ctrl+p" {
-				m.scroll++
-			} else if m.scroll > 0 {
-				m.scroll--
-			}
-			m.clampScroll()
+		} else if k.String() == "up" || k.String() == "ctrl+p" {
+			m.moveHistory(-1)
+		} else {
+			m.moveHistory(1)
 		}
 	case "pgup", "ctrl+u":
 		m.scroll += m.height / 2
@@ -1343,6 +1550,16 @@ func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.deleteInputBackward(true)
 	case "delete":
 		m.deleteInputForward()
+	case "alt+enter":
+		if m.busy {
+			line := strings.TrimSpace(m.input)
+			m.input, m.selected = "", 0
+			m.inputCursor, m.inputAnchor = 0, 0
+			return m.submitFollowUp(line)
+		}
+		m.insertInput([]rune{'\n'})
+	case "shift+enter":
+		m.insertInput([]rune{'\n'})
 	case "enter":
 		line := strings.TrimSpace(m.input)
 		if matches := commandMatches(line); len(matches) > 0 {
@@ -1359,6 +1576,20 @@ func (m appModel) inputKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m appModel) submitFollowUp(line string) (tea.Model, tea.Cmd) {
+	if line == "" {
+		return m, nil
+	}
+	m.add("› " + line)
+	if len(m.history) == 0 || m.history[len(m.history)-1] != line {
+		m.history = append(m.history, line)
+	}
+	m.historyPos, m.historyDraft = len(m.history), ""
+	m.followUps = append(m.followUps, line)
+	m.add(fmt.Sprintf("queued follow-up (%d)", len(m.followUps)))
+	return m, nil
+}
+
 func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 	if line == "" {
 		return m, nil
@@ -1367,8 +1598,40 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 	case "/exit", "/quit":
 		return m, tea.Quit
 	case "/clear":
-		m.loop.Messages, m.transcript = nil, nil
+		if m.busy {
+			m.add("wait for current turn before clearing conversation")
+			return m, nil
+		}
+		if err := m.loop.Clear(); err != nil {
+			m.add("error clearing conversation: " + err.Error())
+			return m, nil
+		}
+		m.transcript = nil
+		m.history, m.historyPos, m.historyDraft = nil, 0, ""
 		m.add("conversation cleared")
+	case "/new":
+		if m.busy {
+			m.add("wait for current turn before starting a new session")
+			return m, nil
+		}
+		if err := m.session.New(m.wd); err != nil {
+			m.add("error starting session: " + err.Error())
+			return m, nil
+		}
+		m.loop.Messages = nil
+		m.transcript = nil
+		m.history, m.historyPos, m.historyDraft = nil, 0, ""
+		m.add("· new session: " + m.session.Path())
+	case "/clone":
+		if m.busy {
+			m.add("wait for current turn before cloning session")
+			return m, nil
+		}
+		if err := m.session.Clone(m.wd, m.loop.Messages); err != nil {
+			m.add("error cloning session: " + err.Error())
+			return m, nil
+		}
+		m.add("· cloned session: " + m.session.Path())
 	case "/help":
 		m.add(strings.Join(commands, "  "))
 	case "/session":
@@ -1436,7 +1699,8 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		}
 		m.busy = true
 		m.add("· compacting")
-		return m, m.compact()
+		cmd := (&m).compact()
+		return m, cmd
 	case "/model":
 		if m.busy {
 			m.add("wait for current turn before changing model")
@@ -1471,16 +1735,63 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.add("› " + line)
+		if len(m.history) == 0 || m.history[len(m.history)-1] != line {
+			m.history = append(m.history, line)
+		}
+		m.historyPos, m.historyDraft = len(m.history), ""
 		m.scroll = 0
 		if m.busy {
 			m.queue = append(m.queue, line)
-			m.add(fmt.Sprintf("queued (%d)", len(m.queue)))
+			if m.steering != nil {
+				select {
+				case m.steering <- line:
+				default:
+				}
+			}
+			m.add(fmt.Sprintf("queued for next turn (%d)", len(m.queue)))
 			return m, nil
 		}
 		m.busy = true
-		return m, m.startTurn(line)
+		cmd := (&m).startTurn(line)
+		return m, cmd
 	}
 	return m, nil
+}
+
+func promptHistory(messages []agent.Message) []string {
+	var history []string
+	for _, message := range messages {
+		if message.Role == "user" && message.Content != "" && !strings.HasPrefix(message.Content, "Session handoff summary:") {
+			history = append(history, message.Content)
+		}
+	}
+	return history
+}
+
+func (m *appModel) moveHistory(delta int) {
+	if len(m.history) == 0 {
+		return
+	}
+	if m.historyPos < 0 || m.historyPos > len(m.history) {
+		m.historyPos = len(m.history)
+	}
+	if delta < 0 {
+		if m.historyPos == len(m.history) {
+			m.historyDraft = m.input
+		}
+		if m.historyPos > 0 {
+			m.historyPos--
+		}
+	} else if m.historyPos < len(m.history) {
+		m.historyPos++
+	}
+	if m.historyPos == len(m.history) {
+		m.input = m.historyDraft
+	} else {
+		m.input = m.history[m.historyPos]
+	}
+	m.inputCursor = len([]rune(m.input))
+	m.inputAnchor = m.inputCursor
 }
 
 func (m appModel) View() string {
@@ -1999,6 +2310,6 @@ func authSource(p agent.Provider) string {
 }
 
 func basePrompt(wd string) string {
-	return fmt.Sprintf(`You are Atom. Working directory: %s. Follow the provided AGENTS.md instructions. Before using a relevant or requested skill, call load_skill and follow its SKILL.md.`, wd)
+	return fmt.Sprintf(`You are Atom, a coding agent working in %s. Use available tools to inspect real state before drawing conclusions. Continue through tool results until the user's request is handled; never claim a tool ran when it did not. Read relevant code and trace callers before editing, make the smallest complete change, and run focused verification. Follow provided AGENTS.md instructions. Before using a relevant or requested skill, call load_skill and follow its SKILL.md.`, wd)
 }
 func fatal(s string) { fmt.Fprintln(os.Stderr, "atom:", s); os.Exit(1) }

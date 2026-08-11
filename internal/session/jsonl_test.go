@@ -112,3 +112,61 @@ func TestLoadMessagesUsesCompactionAsTheNewConversationBaseline(t *testing.T) {
 		t.Fatalf("messages after compaction = %#v", messages)
 	}
 }
+
+func TestLoadMessagesUsesClearAsConversationBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []struct {
+		kind string
+		data any
+	}{
+		{"message", agent.Message{Role: "user", Content: "before"}},
+		{"clear", struct{}{}},
+		{"message", agent.Message{Role: "user", Content: "after"}},
+	} {
+		if err := store.WriteEvent(event.kind, event.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.Close()
+	messages, err := LoadMessages(path)
+	if err != nil || len(messages) != 1 || messages[0].Content != "after" {
+		t.Fatalf("messages = %#v, error = %v", messages, err)
+	}
+}
+
+func TestLoadMessagesIgnoresCrashTruncatedFinalRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := `{"type":"message","at":"2026-01-01T00:00:00Z","data":{"role":"user","content":"keep me"}}` + "\n" + `{"type":"message"`
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := LoadMessages(path)
+	if err != nil || len(messages) != 1 || messages[0].Content != "keep me" {
+		t.Fatalf("messages = %#v, error = %v", messages, err)
+	}
+}
+
+func TestLoadMessagesRejectsMalformedMiddleRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := `{"type":"message","at":"2026-01-01T00:00:00Z","data":{"role":"user","content":"one"}}` + "\n" + `{bad}` + "\n" + `{"type":"message","at":"2026-01-01T00:00:00Z","data":{"role":"assistant","content":"two"}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMessages(path); err == nil {
+		t.Fatal("expected malformed middle record error")
+	}
+}
+
+func TestLoadMessagesRejectsMalformedCompleteFinalRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte("{bad}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMessages(path); err == nil {
+		t.Fatal("expected malformed complete final record error")
+	}
+}

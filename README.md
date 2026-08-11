@@ -1,6 +1,6 @@
 # Atom
 
-Atom is a tiny, dependency-free Go harness for coding agents. It starts as a
+Atom is a tiny, single-binary Go harness for coding agents. It starts as a
 single binary, keeps sessions in readable JSONL, and deliberately has a small
 surface area.
 
@@ -28,6 +28,8 @@ atom
 Atom starts without a selected provider or model. Use `/login` in the app (or
 `atom login openai` / `atom login copilot`) and then select one of the models
 available to that account before starting a conversation.
+Use `atom --provider copilot --list-models` (or `openai`) to inspect the same
+authenticated catalog without opening the UI.
 
 Provider and model choices are saved in `~/.atom/config.json` and apply in
 every folder. A project's `.atom/config.json` can override those defaults.
@@ -36,9 +38,16 @@ every folder. A project's `.atom/config.json` can override those defaults.
 
 - [Documentation](docs/README.md)
 
-GitHub Copilot uses GitHub's supported Copilot CLI transport, bundled into Atom
-release builds. Run `atom login copilot`; Atom opens Copilot's login flow and
-the CLI owns GitHub authentication and model access.
+Atom owns provider authentication and does not require Codex or Copilot CLI.
+Run `atom login openai` for ChatGPT subscription OAuth or
+`atom login copilot` for GitHub Copilot device OAuth. API-key login remains
+available for OpenAI-compatible API access.
+
+Active turns are cancellable with Escape or Ctrl-C. Ctrl-C exits when idle.
+Long sessions compact automatically at configured context usage.
+
+For scripts, `atom --print -p 'prompt'` emits assistant text and
+`atom --json -p 'prompt'` emits JSONL status, text-delta, and tool events.
 
 Inside Atom, run `/update` to pull the latest version and rebuild it. Restart
 Atom after the update completes.

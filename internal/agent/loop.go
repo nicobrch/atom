@@ -29,6 +29,9 @@ type Loop struct {
 	Observer                  Observer
 	InputTokens, OutputTokens int
 	ReasoningEffort           string
+	ContextTokens             int
+	AutoCompactAt             float64
+	Steering                  func() []string
 	// RetryWait is injectable for tests. Production uses a cancellable timer.
 	RetryWait func(context.Context, time.Duration) error
 }
@@ -39,11 +42,21 @@ const (
 )
 
 func (l *Loop) Prompt(ctx context.Context, text string) error {
+	if l.shouldAutoCompact() {
+		if err := l.Compact(ctx); err != nil {
+			return err
+		}
+	}
 	l.Messages = append(l.Messages, Message{Role: "user", Content: text})
 	if err := l.record("message", l.Messages[len(l.Messages)-1]); err != nil {
 		return err
 	}
 	return l.run(ctx)
+}
+
+func (l *Loop) Clear() error {
+	l.Messages = nil
+	return l.record("clear", struct{}{})
 }
 
 func (l *Loop) run(ctx context.Context) error {
@@ -54,6 +67,11 @@ func (l *Loop) run(ctx context.Context) error {
 		defs = append(defs, t.Definition())
 	}
 	for turn := 0; turn < 32; turn++ {
+		if turn > 0 && l.shouldAutoCompact() {
+			if err := l.Compact(ctx); err != nil {
+				return err
+			}
+		}
 		if l.Observer != nil {
 			l.Observer.Status("thinking")
 		}
@@ -61,6 +79,8 @@ func (l *Loop) run(ctx context.Context) error {
 		var text strings.Builder
 		calls := map[int]*ToolCall{}
 		var order []int
+		var providerItems []json.RawMessage
+		var finishReason string
 		requestStarted := time.Now()
 		totalInputTokens, totalOutputTokens := 0, 0
 		for attempt := 1; attempt <= maxStreamAttempts; attempt++ {
@@ -73,7 +93,9 @@ func (l *Loop) run(ctx context.Context) error {
 			var attemptText strings.Builder
 			attemptCalls := map[int]*ToolCall{}
 			var attemptOrder []int
+			var attemptProviderItems []json.RawMessage
 			attemptInputTokens, attemptOutputTokens := 0, 0
+			attemptFinishReason := ""
 			for e := range events {
 				l.InputTokens += e.InputTokens
 				l.OutputTokens += e.OutputTokens
@@ -98,14 +120,25 @@ func (l *Loop) run(ctx context.Context) error {
 					if d.Name != "" {
 						c.Name = d.Name
 					}
-					if d.Arguments != "" {
+					if d.ResetArguments {
+						c.Arguments = append(c.Arguments[:0], d.Arguments...)
+					} else if d.Arguments != "" {
 						c.Arguments = append(c.Arguments, d.Arguments...)
 					}
+				}
+				if len(e.ProviderItem) > 0 {
+					attemptProviderItems = append(attemptProviderItems, append(json.RawMessage(nil), e.ProviderItem...))
+				}
+				if e.FinishReason != "" {
+					attemptFinishReason = e.FinishReason
 				}
 			}
 			totalInputTokens += attemptInputTokens
 			totalOutputTokens += attemptOutputTokens
 			if err := <-errs; err != nil {
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				}
 				failure := failureForDiagnostic(err)
 				if retryable(ctx, failure) && attemptText.Len() == 0 && len(attemptCalls) == 0 && attempt < maxStreamAttempts {
 					delay := retryDelay(attempt)
@@ -137,7 +170,7 @@ func (l *Loop) run(ctx context.Context) error {
 				}
 				return withDiagnosticID(err, req.ID)
 			}
-			text, calls, order = attemptText, attemptCalls, attemptOrder
+			text, calls, order, providerItems, finishReason = attemptText, attemptCalls, attemptOrder, attemptProviderItems, attemptFinishReason
 			l.writeDiagnostic(DiagnosticEvent{
 				Event: "request_succeeded", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
 				ReasoningEffort: req.ReasoningEffort, Turn: turn + 1, Attempt: attempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages), ToolCount: len(req.Tools),
@@ -145,19 +178,13 @@ func (l *Loop) run(ctx context.Context) error {
 			})
 			break
 		}
-		assistant := Message{Role: "assistant", Content: text.String()}
+		assistant := Message{Role: "assistant", Content: text.String(), ProviderItems: providerItems}
 		for _, i := range order {
 			assistant.ToolCalls = append(assistant.ToolCalls, *calls[i])
 		}
 		l.Messages = append(l.Messages, assistant)
 		if err := l.record("message", assistant); err != nil {
 			return err
-		}
-		if len(assistant.ToolCalls) == 0 {
-			if l.Observer != nil {
-				l.Observer.Status("done")
-			}
-			return nil
 		}
 		for _, call := range assistant.ToolCalls {
 			if l.Observer != nil {
@@ -166,13 +193,18 @@ func (l *Loop) run(ctx context.Context) error {
 			tool, ok := lookup[call.Name]
 			var output string
 			var err error
-			if !ok {
+			if finishReason == "length" || finishReason == "max_tokens" {
+				err = fmt.Errorf("tool call was truncated by model output limit and was not executed")
+			} else if !ok {
 				err = fmt.Errorf("unknown tool %q", call.Name)
 			} else {
 				output, err = tool.Run(ctx, call.Arguments)
 			}
 			if err != nil {
-				output = "Error: " + err.Error()
+				if output != "" {
+					output += "\n"
+				}
+				output += "Error: " + err.Error()
 			}
 			if l.Observer != nil {
 				l.Observer.ToolEnd(call, output, err)
@@ -182,6 +214,20 @@ func (l *Loop) run(ctx context.Context) error {
 			if e := l.record("message", result); e != nil {
 				return e
 			}
+		}
+		steering := l.takeSteering()
+		for _, text := range steering {
+			message := Message{Role: "user", Content: text}
+			l.Messages = append(l.Messages, message)
+			if err := l.record("message", message); err != nil {
+				return err
+			}
+		}
+		if len(assistant.ToolCalls) == 0 && len(steering) == 0 {
+			if l.Observer != nil {
+				l.Observer.Status("done")
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("stopped after 32 tool turns")
@@ -300,6 +346,9 @@ func (l *Loop) Compact(ctx context.Context) error {
 		inputTokens += attemptInputTokens
 		outputTokens += attemptOutputTokens
 		if err := <-errs; err != nil {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
 			failure := failureForDiagnostic(err)
 			if retryable(ctx, failure) && attemptText.Len() == 0 && attempt < maxStreamAttempts {
 				delay := retryDelay(attempt)
@@ -335,16 +384,30 @@ func (l *Loop) Compact(ctx context.Context) error {
 		successfulAttempt = attempt
 		break
 	}
+	if strings.TrimSpace(b.String()) == "" {
+		err := fmt.Errorf("provider returned an empty compaction summary")
+		diagnostic := DiagnosticEvent{
+			Event: "compaction_failed", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
+			Attempt: successfulAttempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages),
+			Duration: time.Since(started), DurationMS: time.Since(started).Milliseconds(), InputTokens: inputTokens, OutputTokens: outputTokens,
+			Failure: failureForDiagnostic(err),
+		}
+		l.writeDiagnostic(diagnostic)
+		if recordErr := l.record("error", diagnostic); recordErr != nil {
+			return fmt.Errorf("%w (also failed to record diagnostic %s: %v)", err, req.ID, recordErr)
+		}
+		return withDiagnosticID(err, req.ID)
+	}
 	l.writeDiagnostic(DiagnosticEvent{
 		Event: "compaction_succeeded", RequestID: req.ID, Provider: l.Provider.Name(), Model: req.Model,
 		Attempt: successfulAttempt, MaxAttempts: maxStreamAttempts, MessageCount: len(req.Messages),
 		Duration: time.Since(started), DurationMS: time.Since(started).Milliseconds(), InputTokens: inputTokens, OutputTokens: outputTokens,
 	})
 	summary := Message{Role: "user", Content: "Session handoff summary:\n" + b.String()}
-	l.Messages = []Message{summary}
 	if err := l.record("compaction", summary); err != nil {
 		return err
 	}
+	l.Messages = []Message{summary}
 	if l.Observer != nil {
 		l.Observer.Status("compacted")
 	}
@@ -364,7 +427,19 @@ func (l *Loop) ApproxTokens() int {
 		for _, c := range m.ToolCalls {
 			n += (len(c.Name) + len(c.Arguments) + 3) / 4
 		}
+		for _, item := range m.ProviderItems {
+			n += (len(item) + 3) / 4
+		}
 	}
 	return n
+}
+func (l *Loop) shouldAutoCompact() bool {
+	return len(l.Messages) > 1 && l.ContextTokens > 0 && l.AutoCompactAt > 0 && float64(l.ApproxTokens()) >= float64(l.ContextTokens)*l.AutoCompactAt
+}
+func (l *Loop) takeSteering() []string {
+	if l.Steering == nil {
+		return nil
+	}
+	return l.Steering()
 }
 func (l *Loop) MarshalMessages() ([]byte, error) { return json.Marshal(l.Messages) }

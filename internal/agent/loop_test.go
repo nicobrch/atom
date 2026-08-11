@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,10 @@ func (s *memorySink) WriteEvent(kind string, _ any) error {
 	s.kinds = append(s.kinds, kind)
 	return nil
 }
+
+type errorSink struct{}
+
+func (errorSink) WriteEvent(string, any) error { return errors.New("disk full") }
 
 type memoryDiagnostics struct{ events []DiagnosticEvent }
 
@@ -184,6 +189,30 @@ func TestLoopDoesNotRetryAfterOutput(t *testing.T) {
 	}
 }
 
+type cancellingProvider struct{}
+
+func (cancellingProvider) Name() string { return "test-provider" }
+func (cancellingProvider) Stream(ctx context.Context, _ Request) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(events)
+		defer close(errs)
+		<-ctx.Done()
+		errs <- &ProviderError{Stage: "transport", Message: ctx.Err().Error()}
+	}()
+	return events, errs
+}
+
+func TestLoopReturnsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := (&Loop{Provider: cancellingProvider{}, Model: "test"}).Prompt(ctx, "hello")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+}
+
 func TestCompactRetriesPreOutputOverload(t *testing.T) {
 	p := &overloadThenSuccessProvider{}
 	diagnostics := &memoryDiagnostics{}
@@ -218,10 +247,202 @@ func TestCompactRetriesPreOutputOverload(t *testing.T) {
 	}
 }
 
+type compactionProvider struct{ systems []string }
+
+func (p *compactionProvider) Name() string { return "test-provider" }
+func (p *compactionProvider) Stream(_ context.Context, request Request) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 1)
+	errs := make(chan error)
+	p.systems = append(p.systems, request.System)
+	if strings.Contains(request.System, "Summarize this coding session") {
+		events <- StreamEvent{TextDelta: "old work summary"}
+	} else {
+		events <- StreamEvent{TextDelta: "new answer"}
+	}
+	close(events)
+	close(errs)
+	return events, errs
+}
+
+func TestPromptAutoCompactsBeforeAddingNewUserMessage(t *testing.T) {
+	provider := &compactionProvider{}
+	loop := &Loop{
+		Provider: provider, Model: "test", ContextTokens: 20, AutoCompactAt: .5,
+		Messages: []Message{{Role: "user", Content: strings.Repeat("x", 40)}, {Role: "assistant", Content: "done"}},
+	}
+	if err := loop.Prompt(context.Background(), "new request"); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.systems) != 2 || !strings.Contains(provider.systems[0], "Summarize this coding session") {
+		t.Fatalf("provider systems = %q", provider.systems)
+	}
+	if len(loop.Messages) != 3 || loop.Messages[0].Content != "Session handoff summary:\nold work summary" || loop.Messages[1].Content != "new request" {
+		t.Fatalf("messages = %#v", loop.Messages)
+	}
+}
+
+func TestCompactKeepsMessagesWhenProviderReturnsEmptySummary(t *testing.T) {
+	messages := []Message{{Role: "user", Content: "keep this"}, {Role: "assistant", Content: "and this"}}
+	loop := &Loop{Provider: &scriptedProvider{}, Model: "test", Messages: append([]Message(nil), messages...)}
+	if err := loop.Compact(context.Background()); err == nil || !strings.Contains(err.Error(), "empty compaction summary") {
+		t.Fatalf("error = %v", err)
+	}
+	if !reflect.DeepEqual(loop.Messages, messages) {
+		t.Fatalf("messages changed: %#v", loop.Messages)
+	}
+}
+
+func TestCompactKeepsMessagesWhenSummaryCannotBePersisted(t *testing.T) {
+	messages := []Message{{Role: "user", Content: "keep this"}, {Role: "assistant", Content: "and this"}}
+	loop := &Loop{Provider: &compactionProvider{}, Model: "test", Sink: errorSink{}, Messages: append([]Message(nil), messages...)}
+	if err := loop.Compact(context.Background()); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("error = %v", err)
+	}
+	if !reflect.DeepEqual(loop.Messages, messages) {
+		t.Fatalf("messages changed: %#v", loop.Messages)
+	}
+}
+
 type readFixture struct{}
 
 func (readFixture) Definition() ToolDefinition {
 	return ToolDefinition{Name: "read", Parameters: json.RawMessage(`{"type":"object"}`)}
+}
+
+type outputErrorTool struct{}
+
+func (outputErrorTool) Definition() ToolDefinition {
+	return ToolDefinition{Name: "fail", Parameters: json.RawMessage(`{"type":"object"}`)}
+}
+func (outputErrorTool) Run(context.Context, json.RawMessage) (string, error) {
+	return "useful stderr", errors.New("exit status 1")
+}
+
+type errorToolProvider struct{ calls int }
+
+func (p *errorToolProvider) Name() string { return "scripted" }
+func (p *errorToolProvider) Stream(context.Context, Request) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 1)
+	errs := make(chan error)
+	p.calls++
+	if p.calls == 1 {
+		events <- StreamEvent{ToolCallDelta: &ToolCallDelta{Index: 0, ID: "call-1", Name: "fail", Arguments: `{}`}}
+	}
+	close(events)
+	close(errs)
+	return events, errs
+}
+
+func TestLoopPreservesToolOutputOnFailure(t *testing.T) {
+	loop := &Loop{Provider: &errorToolProvider{}, Model: "test", Tools: []Tool{outputErrorTool{}}}
+	if err := loop.Prompt(context.Background(), "run it"); err != nil {
+		t.Fatal(err)
+	}
+	if got := loop.Messages[2].Content; got != "useful stderr\nError: exit status 1" {
+		t.Fatalf("tool result = %q", got)
+	}
+}
+
+type truncatedToolProvider struct{ calls int }
+
+func (p *truncatedToolProvider) Name() string { return "scripted" }
+func (p *truncatedToolProvider) Stream(context.Context, Request) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 2)
+	errs := make(chan error)
+	p.calls++
+	if p.calls == 1 {
+		events <- StreamEvent{ToolCallDelta: &ToolCallDelta{Index: 0, ID: "call-1", Name: "track", Arguments: `{}`}}
+		events <- StreamEvent{FinishReason: "length"}
+	}
+	close(events)
+	close(errs)
+	return events, errs
+}
+
+type trackingTool struct{ ran *bool }
+
+func (t trackingTool) Definition() ToolDefinition {
+	return ToolDefinition{Name: "track", Parameters: json.RawMessage(`{"type":"object"}`)}
+}
+func (t trackingTool) Run(context.Context, json.RawMessage) (string, error) {
+	*t.ran = true
+	return "ran", nil
+}
+
+func TestLoopDoesNotExecuteTruncatedToolCall(t *testing.T) {
+	ran := false
+	loop := &Loop{Provider: &truncatedToolProvider{}, Model: "test", Tools: []Tool{trackingTool{ran: &ran}}}
+	if err := loop.Prompt(context.Background(), "run it"); err != nil {
+		t.Fatal(err)
+	}
+	if ran || !strings.Contains(loop.Messages[2].Content, "was not executed") {
+		t.Fatalf("ran=%v result=%q", ran, loop.Messages[2].Content)
+	}
+}
+
+type steeringProvider struct{ requests []Request }
+
+func (p *steeringProvider) Name() string { return "scripted" }
+func (p *steeringProvider) Stream(_ context.Context, request Request) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 1)
+	errs := make(chan error)
+	p.requests = append(p.requests, request)
+	if len(p.requests) == 1 {
+		events <- StreamEvent{TextDelta: "initial answer"}
+	} else {
+		events <- StreamEvent{TextDelta: "corrected answer"}
+	}
+	close(events)
+	close(errs)
+	return events, errs
+}
+
+type reasoningReplayProvider struct{ requests []Request }
+
+func (p *reasoningReplayProvider) Name() string { return "scripted" }
+func (p *reasoningReplayProvider) Stream(_ context.Context, request Request) (<-chan StreamEvent, <-chan error) {
+	events := make(chan StreamEvent, 2)
+	errs := make(chan error)
+	p.requests = append(p.requests, request)
+	if len(p.requests) == 1 {
+		events <- StreamEvent{ProviderItem: json.RawMessage(`{"type":"reasoning","encrypted_content":"opaque"}`)}
+		events <- StreamEvent{ToolCallDelta: &ToolCallDelta{Index: 0, ID: "call-1", Name: "read", Arguments: `{"path":"note.txt"}`}}
+	} else {
+		events <- StreamEvent{TextDelta: "done"}
+	}
+	close(events)
+	close(errs)
+	return events, errs
+}
+
+func TestLoopPersistsProviderItemsAcrossToolTurn(t *testing.T) {
+	provider := &reasoningReplayProvider{}
+	loop := &Loop{Provider: provider, Model: "test", Tools: []Tool{readFixture{}}}
+	if err := loop.Prompt(context.Background(), "start"); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.requests) != 2 || len(provider.requests[1].Messages[1].ProviderItems) != 1 || len(loop.Messages[1].ProviderItems) != 1 {
+		t.Fatalf("requests=%#v messages=%#v", provider.requests, loop.Messages)
+	}
+}
+
+func TestLoopAdmitsSteeringBeforeStopping(t *testing.T) {
+	provider := &steeringProvider{}
+	steering := []string{"change direction"}
+	loop := &Loop{Provider: provider, Model: "test", Steering: func() []string {
+		messages := steering
+		steering = nil
+		return messages
+	}}
+	if err := loop.Prompt(context.Background(), "start"); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.requests) != 2 || len(provider.requests[1].Messages) != 3 || provider.requests[1].Messages[2].Content != "change direction" {
+		t.Fatalf("requests = %#v", provider.requests)
+	}
+	if len(loop.Messages) != 4 || loop.Messages[3].Content != "corrected answer" {
+		t.Fatalf("messages = %#v", loop.Messages)
+	}
 }
 func (readFixture) Run(_ context.Context, args json.RawMessage) (string, error) {
 	if string(args) != `{"path":"note.txt"}` {

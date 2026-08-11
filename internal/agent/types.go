@@ -11,10 +11,11 @@ import (
 // Message is the provider-neutral conversation record. Tool calls use the
 // OpenAI-compatible shape, which both bundled providers understand.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role          string            `json:"role"`
+	Content       string            `json:"content,omitempty"`
+	ToolCalls     []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID    string            `json:"tool_call_id,omitempty"`
+	ProviderItems []json.RawMessage `json:"provider_items,omitempty"`
 }
 
 type ToolCall struct {
@@ -46,16 +47,18 @@ type Request struct {
 type StreamEvent struct {
 	TextDelta     string
 	ToolCallDelta *ToolCallDelta
+	ProviderItem  json.RawMessage
 	FinishReason  string
 	InputTokens   int
 	OutputTokens  int
 }
 
 type ToolCallDelta struct {
-	Index     int
-	ID        string
-	Name      string
-	Arguments string
+	Index          int
+	ID             string
+	Name           string
+	Arguments      string
+	ResetArguments bool
 }
 
 type Provider interface {

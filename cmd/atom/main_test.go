@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -69,7 +71,6 @@ func TestUpdateAtomPullsAndRebuildsGlobalInstallation(t *testing.T) {
 	}
 	want := [][]string{
 		{"/home/user/.atom", "git", "pull", "--ff-only"},
-		{"/home/user/.atom", "go", "tool", "bundler", "-output", "cmd/atom"},
 		{"/home/user/.atom", "go", "build", "-o", "/home/user/.atom/atom", "./cmd/atom"},
 	}
 	if !slices.EqualFunc(calls, want, func(a, b []string) bool { return slices.Equal(a, b) }) {
@@ -91,7 +92,7 @@ func TestUpdateAtomUsesSourceSubdirectory(t *testing.T) {
 	if err := updateAtom(home, run); err != nil {
 		t.Fatal(err)
 	}
-	if calls[0][0] != source || calls[1][0] != source || calls[2][0] != source || calls[2][4] != filepath.Join(home, "atom") {
+	if calls[0][0] != source || calls[1][0] != source || calls[1][4] != filepath.Join(home, "atom") {
 		t.Fatalf("update commands = %q", calls)
 	}
 }
@@ -204,8 +205,57 @@ func TestSkillsAndCompactCommandsAreHandled(t *testing.T) {
 	}
 	got, cmd := m.submit("/compact")
 	m = got.(appModel)
-	if !m.busy || cmd == nil || m.transcript[len(m.transcript)-1] != "· compacting" {
+	if !m.busy || cmd == nil || m.turnCancel == nil || m.transcript[len(m.transcript)-1] != "· compacting" {
 		t.Fatalf("compact state: busy=%v transcript=%q", m.busy, m.transcript)
+	}
+	m.turnCancel()
+}
+
+func TestClearWaitsForActiveTurn(t *testing.T) {
+	m := appModel{busy: true, loop: &agent.Loop{Messages: []agent.Message{{Role: "user", Content: "keep"}}}}
+	got, _ := m.submit("/clear")
+	m = got.(appModel)
+	if len(m.loop.Messages) != 1 || !strings.Contains(m.transcript[0], "wait for current turn") {
+		t.Fatalf("messages=%#v transcript=%q", m.loop.Messages, m.transcript)
+	}
+}
+
+func TestNewAndClonePreserveSessionHistory(t *testing.T) {
+	wd := t.TempDir()
+	store, err := session.New(wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := &resumableSession{store: store}
+	messages := []agent.Message{{Role: "user", Content: "keep this"}, {Role: "assistant", Content: "kept"}}
+	for _, message := range messages {
+		if err := active.WriteEvent("message", message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := active.Path()
+	m := appModel{loop: &agent.Loop{Messages: messages}, session: active, wd: wd}
+	got, _ := m.submit("/clone")
+	m = got.(appModel)
+	clone := active.Path()
+	if clone == original {
+		t.Fatal("clone did not switch session")
+	}
+	loaded, err := session.LoadMessages(clone)
+	if err != nil || !reflect.DeepEqual(loaded, messages) {
+		t.Fatalf("cloned messages=%#v error=%v", loaded, err)
+	}
+	got, _ = m.submit("/new")
+	m = got.(appModel)
+	if active.Path() == clone || len(m.loop.Messages) != 0 || len(m.history) != 0 {
+		t.Fatalf("new session path=%q messages=%#v history=%q", active.Path(), m.loop.Messages, m.history)
+	}
+	loaded, err = session.LoadMessages(original)
+	if err != nil || !reflect.DeepEqual(loaded, messages) {
+		t.Fatalf("original messages=%#v error=%v", loaded, err)
+	}
+	if err := active.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -323,11 +373,38 @@ func TestSkillToolUsesProgressiveDisclosure(t *testing.T) {
 
 func TestBasePromptOnlySuppliesOperationalContext(t *testing.T) {
 	prompt := basePrompt("/workspace")
-	if !strings.Contains(prompt, "Working directory: /workspace") || !strings.Contains(prompt, "load_skill") {
+	if !strings.Contains(prompt, "working in /workspace") || !strings.Contains(prompt, "never claim a tool ran") || !strings.Contains(prompt, "load_skill") {
 		t.Fatalf("base prompt is missing required operational context: %q", prompt)
 	}
 	if strings.Contains(prompt, "careful terminal coding agent") {
 		t.Fatalf("base prompt retains the removed persona: %q", prompt)
+	}
+}
+
+func TestJSONObserverIncludesToolResultAndError(t *testing.T) {
+	var output bytes.Buffer
+	observer := &jsonObserver{encoder: json.NewEncoder(&output)}
+	call := agent.ToolCall{ID: "call-1", Name: "bash", Arguments: json.RawMessage(`{"command":"false"}`)}
+	observer.ToolStart(call)
+	observer.ToolEnd(call, "stderr", errors.New("exit status 1"))
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"type":"tool_start"`) || !strings.Contains(lines[1], `"output":"stderr"`) || !strings.Contains(lines[1], `"error":"exit status 1"`) {
+		t.Fatalf("events = %q", lines)
+	}
+}
+
+func TestToolCallLabelShowsTargetWithoutWriteContent(t *testing.T) {
+	label := toolCallLabel(agent.ToolCall{Name: "write", Arguments: json.RawMessage(`{"path":"note.txt","content":"private contents"}`)})
+	if label != "write  note.txt" || strings.Contains(label, "private") {
+		t.Fatalf("label = %q", label)
+	}
+}
+
+func TestUIObserverKeepsFailedToolOutput(t *testing.T) {
+	events := make(chan tea.Msg, 1)
+	uiObserver{events: events}.ToolEnd(agent.ToolCall{}, "useful stderr\nError: exit status 1", errors.New("exit status 1"))
+	if event := (<-events).(uiTool); !strings.Contains(event.output, "useful stderr") {
+		t.Fatalf("output = %q", event.output)
 	}
 }
 
@@ -370,7 +447,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 		cfg:    config.Defaults(),
 	}
 	view := m.View()
-	versionIndex := strings.Index(view, "atom 0.2.0")
+	versionIndex := strings.Index(view, "atom 0.3.0")
 	subscriptionIndex := strings.Index(view, "Sign in required")
 	if versionIndex < 0 || subscriptionIndex < 0 {
 		t.Fatalf("header metadata missing from view: %q", view[:100])
@@ -378,7 +455,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 	if strings.Count(view[:subscriptionIndex], "\n") <= strings.Count(view[:versionIndex], "\n") {
 		t.Fatalf("subscription should be below version")
 	}
-	if strings.Contains(view, "Atom 0.2.0") {
+	if strings.Contains(view, "Atom 0.3.0") {
 		t.Fatalf("version label should use lowercase atom")
 	}
 }
@@ -401,6 +478,50 @@ func TestConversationRequiresLogin(t *testing.T) {
 	if cmd != nil || m.busy || len(m.transcript) != 1 || !strings.Contains(m.transcript[0], "sign in required") {
 		t.Fatalf("unavailable provider started a conversation: %#v", m)
 	}
+}
+
+func TestEscapeCancelsActiveTurn(t *testing.T) {
+	cancelled := false
+	m := appModel{busy: true, turnCancel: func() { cancelled = true }}
+	got, _ := m.inputKey(tea.KeyMsg{Type: tea.KeyEsc})
+	m = got.(appModel)
+	if !cancelled || m.transcript[len(m.transcript)-1] != "· cancelling turn" {
+		t.Fatalf("cancelled=%v transcript=%q", cancelled, m.transcript)
+	}
+}
+
+func TestSubmittingTurnStoresCancellationBeforeReturningModel(t *testing.T) {
+	m := appModel{ctx: context.Background(), loop: &agent.Loop{Provider: &provider.OpenAICompatible{}, Model: "test"}}
+	got, cmd := m.submit("hello")
+	m = got.(appModel)
+	if cmd == nil || !m.busy || m.turnCancel == nil {
+		t.Fatalf("command=%v busy=%v cancel=%v", cmd, m.busy, m.turnCancel)
+	}
+	m.turnCancel()
+}
+
+func TestBusySubmissionDoesNotBlockWhenSteeringBufferIsFull(t *testing.T) {
+	steering := make(chan string, 1)
+	steering <- "already queued"
+	m := appModel{busy: true, steering: steering, loop: &agent.Loop{Provider: &provider.OpenAICompatible{}, Model: "test"}}
+	got, _ := m.submit("follow up")
+	m = got.(appModel)
+	if !slices.Equal(m.queue, []string{"follow up"}) {
+		t.Fatalf("queue = %q", m.queue)
+	}
+}
+
+func TestQueuedFallbackDoesNotDuplicateVisiblePrompt(t *testing.T) {
+	m := appModel{
+		ctx: context.Background(), busy: true, queue: []string{"follow up"}, transcript: []string{"› follow up"},
+		loop: &agent.Loop{Provider: &provider.OpenAICompatible{}, Model: "test"},
+	}
+	got, cmd := m.Update(turnDone{err: errors.New("failed")})
+	m = got.(appModel)
+	if cmd == nil || !m.busy || strings.Count(strings.Join(m.transcript, "\n"), "› follow up") != 1 {
+		t.Fatalf("busy=%v transcript=%q", m.busy, m.transcript)
+	}
+	m.turnCancel()
 }
 
 func TestHorizontalMenuUsesLeftAndRightArrows(t *testing.T) {
@@ -451,6 +572,19 @@ func TestSelectingModelOpensItsEffortPicker(t *testing.T) {
 	}
 	if len(m.menu) != 2 || m.menu[0] != "low" || m.menu[1] != "high" {
 		t.Fatalf("effort options = %q", m.menu)
+	}
+}
+
+func TestNormalizedEffortClearsUnsupportedSavedValue(t *testing.T) {
+	models := []provider.Model{{ID: "gpt-4.1"}, {ID: "reasoning", DefaultEffort: "medium", Efforts: []string{"low", "medium"}}}
+	if got := normalizedEffort("gpt-4.1", "xhigh", models); got != "" {
+		t.Fatalf("non-reasoning effort = %q", got)
+	}
+	if got := normalizedEffort("reasoning", "xhigh", models); got != "medium" {
+		t.Fatalf("reasoning fallback = %q", got)
+	}
+	if got := normalizedEffort("catalog-alias", "xhigh", models); got != "" {
+		t.Fatalf("unknown-model effort = %q", got)
 	}
 }
 
@@ -512,6 +646,65 @@ func TestComposerWrapsLongInputIntoVerticalRows(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "│\033[0m › abcdefghijkl") || !strings.Contains(view, "│\033[0m   mnopqrstuv") {
 		t.Fatalf("composer did not render vertical rows: %q", view)
+	}
+}
+
+func TestAltEnterInsertsNewlineWithoutSubmitting(t *testing.T) {
+	m := appModel{width: 80, input: "one", inputCursor: 3, inputAnchor: 3}
+	got, cmd := m.inputKey(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	m = got.(appModel)
+	if cmd != nil || m.input != "one\n" || m.inputCursor != 4 {
+		t.Fatalf("input=%q cursor=%d command=%v", m.input, m.inputCursor, cmd)
+	}
+}
+
+func TestAltEnterQueuesFollowUpWhileBusy(t *testing.T) {
+	m := appModel{busy: true, width: 80, input: "after everything", inputCursor: 16, inputAnchor: 16}
+	got, cmd := m.inputKey(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	m = got.(appModel)
+	if cmd != nil || m.input != "" || !slices.Equal(m.followUps, []string{"after everything"}) || m.transcript[len(m.transcript)-1] != "queued follow-up (1)" {
+		t.Fatalf("input=%q follow-ups=%q transcript=%q", m.input, m.followUps, m.transcript)
+	}
+}
+
+func TestFollowUpStartsOnlyAfterTurnCompletes(t *testing.T) {
+	m := appModel{
+		ctx: context.Background(), busy: true, followUps: []string{"after everything"},
+		loop: &agent.Loop{Provider: &provider.OpenAICompatible{}, Model: "test"},
+	}
+	got, cmd := m.Update(turnDone{})
+	m = got.(appModel)
+	if cmd == nil || !m.busy || len(m.followUps) != 0 || m.turnCancel == nil {
+		t.Fatalf("busy=%v follow-ups=%q cancel=%v", m.busy, m.followUps, m.turnCancel)
+	}
+	m.turnCancel()
+}
+
+func TestPromptHistoryNavigatesAndRestoresDraft(t *testing.T) {
+	m := appModel{width: 80, input: "draft", inputCursor: 5, inputAnchor: 5, history: []string{"first", "second"}, historyPos: 2}
+	got, _ := m.inputKey(tea.KeyMsg{Type: tea.KeyUp})
+	m = got.(appModel)
+	if m.input != "second" {
+		t.Fatalf("first history input = %q", m.input)
+	}
+	got, _ = m.inputKey(tea.KeyMsg{Type: tea.KeyUp})
+	m = got.(appModel)
+	if m.input != "first" {
+		t.Fatalf("second history input = %q", m.input)
+	}
+	got, _ = m.inputKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = got.(appModel)
+	got, _ = m.inputKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = got.(appModel)
+	if m.input != "draft" || m.inputCursor != 5 {
+		t.Fatalf("restored draft = %q at %d", m.input, m.inputCursor)
+	}
+}
+
+func TestPromptHistoryExcludesCompactionSummary(t *testing.T) {
+	history := promptHistory([]agent.Message{{Role: "user", Content: "one"}, {Role: "user", Content: "Session handoff summary:\nsummary"}, {Role: "assistant", Content: "reply"}})
+	if !slices.Equal(history, []string{"one"}) {
+		t.Fatalf("history = %q", history)
 	}
 }
 

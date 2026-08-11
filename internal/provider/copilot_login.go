@@ -1,33 +1,41 @@
 package provider
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
-// copilotClientID belongs to Atom's GitHub OAuth app. It is public client
-// metadata, not a client secret; GitHub Device Flow only uses the client ID.
-const copilotClientID = "Ov23liymK8r0F637IA3P"
+// Public GitHub Copilot Chat client metadata. Device Flow uses no client
+// secret; this client is required for GitHub's Copilot token exchange.
+const copilotClientID = "Iv1.b507a08c87ecfe98"
 
 type CopilotDeviceCode struct {
 	VerificationURI string `json:"verification_uri"`
 	UserCode        string `json:"user_code"`
 	DeviceCode      string `json:"device_code"`
 	Interval        int    `json:"interval"`
+	ExpiresIn       int    `json:"expires_in"`
 }
 
-func StartCopilotLogin() (CopilotDeviceCode, error) {
-	b, _ := json.Marshal(map[string]string{"client_id": copilotClientID, "scope": "read:user"})
-	req, err := http.NewRequest(http.MethodPost, "https://github.com/login/device/code", bytes.NewReader(b))
+func StartCopilotLogin(ctx context.Context) (CopilotDeviceCode, error) {
+	return startCopilotLogin(ctx, http.DefaultClient, "https://github.com/login/device/code")
+}
+
+func startCopilotLogin(ctx context.Context, client *http.Client, endpoint string) (CopilotDeviceCode, error) {
+	form := url.Values{"client_id": {copilotClientID}, "scope": {"read:user"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return CopilotDeviceCode{}, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "GitHubCopilotChat/0.35.0")
+	resp, err := client.Do(req)
 	if err != nil {
 		return CopilotDeviceCode{}, err
 	}
@@ -39,8 +47,12 @@ func StartCopilotLogin() (CopilotDeviceCode, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&code); err != nil {
 		return CopilotDeviceCode{}, err
 	}
-	if code.DeviceCode == "" || code.UserCode == "" {
+	if code.DeviceCode == "" || code.UserCode == "" || code.VerificationURI == "" || code.ExpiresIn < 1 {
 		return CopilotDeviceCode{}, fmt.Errorf("invalid Copilot device response")
+	}
+	verificationURL, err := url.Parse(code.VerificationURI)
+	if err != nil || verificationURL.Host == "" || verificationURL.Scheme != "https" && verificationURL.Scheme != "http" {
+		return CopilotDeviceCode{}, fmt.Errorf("invalid Copilot verification URI")
 	}
 	if code.Interval < 1 {
 		code.Interval = 5
@@ -48,15 +60,29 @@ func StartCopilotLogin() (CopilotDeviceCode, error) {
 	return code, nil
 }
 
-func FinishCopilotLogin(code CopilotDeviceCode) error {
+func FinishCopilotLogin(ctx context.Context, code CopilotDeviceCode) error {
+	interval := time.Duration(code.Interval) * time.Second
+	deadline := time.NewTimer(time.Duration(code.ExpiresIn) * time.Second)
+	defer deadline.Stop()
 	for {
-		b, _ := json.Marshal(map[string]string{"client_id": copilotClientID, "device_code": code.DeviceCode, "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
-		req, err := http.NewRequest(http.MethodPost, "https://github.com/login/oauth/access_token", bytes.NewReader(b))
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+			return fmt.Errorf("Copilot login timed out")
+		case <-timer.C:
+		}
+		form := url.Values{"client_id": {copilotClientID}, "device_code": {code.DeviceCode}, "grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://github.com/login/oauth/access_token", strings.NewReader(form.Encode()))
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "GitHubCopilotChat/0.35.0")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return err
@@ -76,10 +102,8 @@ func FinishCopilotLogin(code CopilotDeviceCode) error {
 		if result.Error != "authorization_pending" && result.Error != "slow_down" {
 			return fmt.Errorf("Copilot login failed: %s", result.Error)
 		}
-		delay := code.Interval
 		if result.Error == "slow_down" {
-			delay += 5
+			interval += 5 * time.Second
 		}
-		time.Sleep(time.Duration(delay) * time.Second)
 	}
 }

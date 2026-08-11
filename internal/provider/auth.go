@@ -9,11 +9,22 @@ import (
 )
 
 type savedAuth struct {
-	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
-	CopilotToken string `json:"copilot_token,omitempty"`
+	OpenAIAPIKey string           `json:"openai_api_key,omitempty"`
+	CopilotToken string           `json:"copilot_token,omitempty"`
+	OpenAIOAuth  *OAuthCredential `json:"openai_oauth,omitempty"`
+}
+
+type OAuthCredential struct {
+	Access    string `json:"access"`
+	Refresh   string `json:"refresh"`
+	Expires   int64  `json:"expires"`
+	AccountID string `json:"account_id,omitempty"`
 }
 
 func authPath() (string, error) {
+	if home := os.Getenv("ATOM_HOME"); home != "" {
+		return filepath.Join(home, "auth.json"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -57,7 +68,24 @@ func saveAuth(update func(*savedAuth)) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0600)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".auth-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func SaveAPIKey(name, key string) error {
@@ -67,7 +95,10 @@ func SaveAPIKey(name, key string) error {
 	}
 	switch name {
 	case "openai":
-		return saveAuth(func(auth *savedAuth) { auth.OpenAIAPIKey = key })
+		return saveAuth(func(auth *savedAuth) {
+			auth.OpenAIAPIKey = key
+			auth.OpenAIOAuth = nil
+		})
 	case "copilot", "github-copilot":
 		return saveAuth(func(auth *savedAuth) { auth.CopilotToken = key })
 	default:
@@ -77,4 +108,11 @@ func SaveAPIKey(name, key string) error {
 
 func SaveCopilotToken(token string) error {
 	return SaveAPIKey("copilot", token)
+}
+
+func saveOpenAIOAuth(credential OAuthCredential) error {
+	return saveAuth(func(auth *savedAuth) {
+		auth.OpenAIAPIKey = ""
+		auth.OpenAIOAuth = &credential
+	})
 }
