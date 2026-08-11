@@ -117,7 +117,7 @@ func (p *CopilotSDK) sdkTools(ctx context.Context, defs []agent.ToolDefinition) 
 		params := map[string]any{}
 		_ = json.Unmarshal(def.Parameters, &params)
 		tool := byName[def.Name]
-		tools = append(tools, copilot.Tool{Name: def.Name, Description: def.Description, Parameters: params, Handler: func(inv copilot.ToolInvocation) (copilot.ToolResult, error) {
+		tools = append(tools, copilot.Tool{Name: def.Name, Description: def.Description, Parameters: params, OverridesBuiltInTool: true, Handler: func(inv copilot.ToolInvocation) (copilot.ToolResult, error) {
 			if tool == nil {
 				return copilot.ToolResult{}, fmt.Errorf("unknown tool %q", inv.ToolName)
 			}
