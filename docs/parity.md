@@ -12,7 +12,7 @@ records current evidence and remaining breadth so parity claims stay testable.
 | Interactive work | Streaming UI, multiline editor, prompt history, steering and follow-up queues, cancellation, model/effort picker, context status | Complete |
 | Durable sessions | Private JSONL, resume, new, clone, clear events, automatic/manual fail-closed compaction, truncated-tail recovery | Complete |
 | Automation | Plain one-shot output, JSONL event mode, explicit session reuse, authenticated model listing | Complete |
-| Instructions and customization | Hierarchical `AGENTS.md`, Agent Skills discovery and progressive loading, arbitrary CLI workflows through `bash` | Complete for pi's CLI-plus-skills path |
+| Instructions and customization | Hierarchical `AGENTS.md`, progressive or configured automatic Agent Skills loading, and isolated Pi-compatible user agent profiles | Complete for user instruction, skill, and delegated-profile workflows |
 | Built-in MCP | pi intentionally omits it; Atom does too | Not a parity gap |
 | Permission popups | pi intentionally omits them; Atom documents real process authority and file-tool boundaries | Not a parity gap |
 | Session tree/revert | Atom supports resume/new/clone, not point-in-time navigation inside one session | Optional breadth |

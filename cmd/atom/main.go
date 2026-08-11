@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -28,7 +29,7 @@ import (
 	"github.com/nicobrch/atom/internal/tool"
 )
 
-const version = "0.3.1"
+const version = "0.4.0"
 const headerPadding = 1
 const composerPadding = 1
 
@@ -174,7 +175,16 @@ func main() {
 	if err != nil {
 		fatal(err.Error())
 	}
-	system := basePrompt(wd) + "\n\n" + agentsText + "\n\n" + instructions.SkillCatalog(skills)
+	autoSkillsText, _, err := instructions.AutoLoadSkills(skills, cfg.AutoLoadSkills)
+	if err != nil {
+		fatal(err.Error())
+	}
+	profiles, err := instructions.DiscoverAgentProfiles(atomHome)
+	if err != nil {
+		fatal(err.Error())
+	}
+	delegateSystem := basePrompt(wd) + "\n\n" + agentsText + "\n\n" + instructions.SkillCatalog(skills) + autoSkillsText
+	system := delegateSystem + "\n" + instructions.AgentCatalog(profiles)
 	var store *session.JSONL
 	if sessionPath != "" {
 		if !filepath.IsAbs(sessionPath) {
@@ -205,6 +215,9 @@ func main() {
 	sessionSink := &resumableSession{store: store}
 	defer sessionSink.Close()
 	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, AutoCompactAt: cfg.AutoCompactAt, Tools: agentTools, System: system, Sink: sessionSink, Diagnostics: logStore, Observer: obs}
+	if len(profiles) > 0 {
+		loop.Tools = append(loop.Tools, delegateTool{profiles: profiles, parent: loop, system: delegateSystem, tools: agentTools})
+	}
 	if sessionPath != "" {
 		messages, e := session.LoadMessages(sessionPath)
 		if e != nil {
@@ -225,7 +238,7 @@ func main() {
 		}
 		return
 	}
-	runApp(ctx, loop, skills, sessionSink, logStore.Path(), atomHome, cfg, wd, len(agentFiles))
+	runApp(ctx, loop, skills, profiles, sessionSink, logStore.Path(), atomHome, cfg, wd, len(agentFiles))
 }
 
 func runLogin(args []string) {
@@ -347,6 +360,93 @@ func (t skillTool) Run(_ context.Context, raw json.RawMessage) (string, error) {
 	return instructions.LoadSkill(t.skills, args.Name)
 }
 
+type delegateTool struct {
+	profiles []instructions.AgentProfile
+	parent   *agent.Loop
+	system   string
+	tools    []agent.Tool
+}
+
+func (t delegateTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name:        "delegate",
+		Description: "Run one bounded task with a listed specialized agent in an isolated context. Delegated agents cannot delegate again.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"agent":{"type":"string"},"task":{"type":"string"}},"required":["agent","task"],"additionalProperties":false}`),
+	}
+}
+
+func (t delegateTool) Run(ctx context.Context, raw json.RawMessage) (string, error) {
+	var args struct {
+		Agent string `json:"agent"`
+		Task  string `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return "", fmt.Errorf("parse delegate arguments: %w", err)
+	}
+	if strings.TrimSpace(args.Agent) == "" || strings.TrimSpace(args.Task) == "" {
+		return "", fmt.Errorf("agent and task are required")
+	}
+	profile, err := instructions.FindAgentProfile(t.profiles, args.Agent)
+	if err != nil {
+		return "", err
+	}
+	p, model, err := delegatedProvider(t.parent.Provider, t.parent.Model, profile.Model)
+	if err != nil {
+		return "", err
+	}
+	tools, err := selectTools(t.tools, profile.Tools)
+	if err != nil {
+		return "", fmt.Errorf("agent %s: %w", profile.Name, err)
+	}
+	child := &agent.Loop{Provider: p, Model: model, ReasoningEffort: t.parent.ReasoningEffort, Tools: tools, System: t.system + "\n\nSpecialized agent profile " + profile.Name + ":\n" + profile.Prompt}
+	if err := child.Prompt(ctx, args.Task); err != nil {
+		return "", err
+	}
+	for i := len(child.Messages) - 1; i >= 0; i-- {
+		if child.Messages[i].Role == "assistant" && strings.TrimSpace(child.Messages[i].Content) != "" {
+			return child.Messages[i].Content, nil
+		}
+	}
+	return "", fmt.Errorf("agent %s returned no final response", profile.Name)
+}
+
+func selectTools(available []agent.Tool, names []string) ([]agent.Tool, error) {
+	if len(names) == 0 {
+		return available, nil
+	}
+	byName := make(map[string]agent.Tool, len(available))
+	for _, tool := range available {
+		byName[tool.Definition().Name] = tool
+	}
+	selected := make([]agent.Tool, 0, len(names))
+	for _, name := range names {
+		tool, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf("unsupported tool %q", name)
+		}
+		selected = append(selected, tool)
+	}
+	return selected, nil
+}
+
+func delegatedProvider(current agent.Provider, currentModel, configured string) (agent.Provider, string, error) {
+	if configured == "" {
+		return current, currentModel, nil
+	}
+	providerName, model, qualified := strings.Cut(configured, "/")
+	if !qualified {
+		return current, configured, nil
+	}
+	if providerName == "github-copilot" {
+		providerName = "copilot"
+	}
+	if providerName == current.Name() {
+		return current, model, nil
+	}
+	p, err := selectProvider(providerName)
+	return p, model, err
+}
+
 type unavailableProvider struct{ err error }
 
 func (p unavailableProvider) Name() string { return "not logged in" }
@@ -391,7 +491,7 @@ func (o *jsonObserver) Status(status string) {
 }
 
 var commands = []string{
-	"/clear", "/clone", "/compact", "/exit", "/help", "/login", "/effort", "/logs", "/new",
+	"/agents", "/clear", "/clone", "/compact", "/exit", "/help", "/login", "/effort", "/logs", "/new",
 	"/model", "/resume", "/session", "/skill", "/skills", "/update",
 }
 
@@ -544,11 +644,14 @@ func toolCallLabel(call agent.ToolCall) string {
 		Command string `json:"command"`
 		Pattern string `json:"pattern"`
 		Name    string `json:"name"`
+		Agent   string `json:"agent"`
+		Task    string `json:"task"`
 	}
 	_ = json.Unmarshal(call.Arguments, &args)
 	detail := map[string]string{
 		"bash": args.Command, "read": args.Path, "write": args.Path,
 		"edit": args.Path, "grep": args.Pattern, "load_skill": args.Name,
+		"delegate": strings.TrimSpace(args.Agent + " " + args.Task),
 	}[call.Name]
 	detail = strings.Join(strings.Fields(detail), " ")
 	if runes := []rune(detail); len(runes) > 140 {
@@ -564,6 +667,7 @@ type appModel struct {
 	ctx            context.Context
 	loop           *agent.Loop
 	skills         []instructions.Skill
+	profiles       []instructions.AgentProfile
 	session        *resumableSession
 	sessionHistory []session.HistoryEntry
 	logPath        string
@@ -602,7 +706,7 @@ type appModel struct {
 	historyDraft   string
 }
 
-func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, sessionSink *resumableSession, logPath, atomHome string, cfg config.Config, wd string, agentFiles int) {
+func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, profiles []instructions.AgentProfile, sessionSink *resumableSession, logPath, atomHome string, cfg config.Config, wd string, agentFiles int) {
 	events := make(chan tea.Msg, 64)
 	steering := make(chan string, 64)
 	loop.Steering = func() []string {
@@ -621,7 +725,7 @@ func runApp(ctx context.Context, loop *agent.Loop, skills []instructions.Skill, 
 	}
 	loop.Observer = uiObserver{events: events}
 	history := promptHistory(loop.Messages)
-	m := appModel{ctx: ctx, loop: loop, skills: skills, session: sessionSink, logPath: logPath, atomHome: atomHome, cfg: cfg, wd: wd, events: events, steering: steering, history: history, historyPos: len(history), width: 100, height: 30}
+	m := appModel{ctx: ctx, loop: loop, skills: skills, profiles: profiles, session: sessionSink, logPath: logPath, atomHome: atomHome, cfg: cfg, wd: wd, events: events, steering: steering, history: history, historyPos: len(history), width: 100, height: 30}
 	if agentFiles > 0 {
 		m.transcript = append(m.transcript, fmt.Sprintf("Loaded %d AGENTS.md file(s)", agentFiles))
 	}
@@ -1694,6 +1798,13 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		for _, skill := range m.skills {
 			m.add(fmt.Sprintf("%s — %s (%s, %s)", skill.Name, skill.Description, skill.Scope, skill.Path))
 		}
+	case "/agents":
+		if len(m.profiles) == 0 {
+			m.add("no agents found")
+		}
+		for _, profile := range m.profiles {
+			m.add(fmt.Sprintf("%s — %s (%s)", profile.Name, profile.Description, profile.Path))
+		}
 	case "/skill":
 		if m.busy {
 			m.add("wait for current turn before loading a skill")
@@ -1897,6 +2008,9 @@ func (m appModel) View() string {
 	if m.loop.ReasoningEffort != "" {
 		state += "  ·  " + m.loop.ReasoningEffort
 	}
+	if loaded := autoSkillStatus(m.cfg.AutoLoadSkills); loaded != "" {
+		state += "  ·  " + loaded
+	}
 	if m.busy {
 		state += "  ·  working"
 	}
@@ -1907,6 +2021,22 @@ func (m appModel) View() string {
 	left, gap, right := footerParts(state, contextStatus(m.loop, m.contextTokenLimit()), width)
 	fmt.Fprintf(&b, "\033[36m%s\033[0m%s\033[2m%s\033[0m", left, gap, right)
 	return b.String()
+}
+
+func autoSkillStatus(configured map[string]string) string {
+	names := make([]string, 0, len(configured))
+	for name := range configured {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for i, name := range names {
+		level := strings.ToUpper(strings.TrimSpace(configured[name]))
+		if level == "" {
+			level = "ON"
+		}
+		names[i] = name + " " + level
+	}
+	return strings.Join(names, " · ")
 }
 
 func (m appModel) pickerView(title, action, moreLabel, countLabel string) string {

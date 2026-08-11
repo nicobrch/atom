@@ -46,6 +46,11 @@ available for OpenAI-compatible API access.
 Active turns are cancellable with Escape or Ctrl-C. Ctrl-C exits when idle.
 Long sessions compact automatically at configured context usage.
 
+Agent Skills live under `~/.agents/skills`. Skills configured in
+`auto_load_skills` apply at startup; Pi-compatible specialized agents under
+`~/.atom/agents` are available through bounded delegation. See
+[agent instructions and skills](docs/agent-instructions.md).
+
 For scripts, `atom --print -p 'prompt'` emits assistant text and
 `atom --json -p 'prompt'` emits JSONL status, text-delta, and tool events.
 

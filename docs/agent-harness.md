@@ -26,6 +26,8 @@ continue through Chat Completions.
 - Failed shell commands return both captured output and exit error to the
   model.
 - `read` accepts one-based `offset` and `limit` line ranges for large files.
+- Pi-compatible user agent profiles can handle bounded tasks through isolated,
+  non-recursive `delegate` calls.
 - File writes and edits are atomic and preserve existing permission bits.
 - A crash-truncated final JSONL record is ignored on resume; malformed records
   in the middle still fail closed.

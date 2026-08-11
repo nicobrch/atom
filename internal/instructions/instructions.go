@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -23,6 +24,11 @@ type Options struct {
 
 type Skill struct {
 	Name, Description, Path, Scope string
+}
+
+type AgentProfile struct {
+	Name, Description, Model, Prompt, Path string
+	Tools                                  []string
 }
 
 func DefaultOptions() Options {
@@ -201,6 +207,95 @@ func SkillCatalog(skills []Skill) string {
 	return b.String()
 }
 
+func AutoLoadSkills(skills []Skill, configured map[string]string) (string, []string, error) {
+	names := make([]string, 0, len(configured))
+	for name := range configured {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		contents, err := LoadSkill(skills, name)
+		if err != nil {
+			return "", nil, fmt.Errorf("auto-load skill %s: %w", name, err)
+		}
+		value := strings.TrimSpace(configured[name])
+		if value == "" {
+			value = "default"
+		}
+		fmt.Fprintf(&b, "\n\nAuto-loaded skill %s. Activation value: %s.\n%s", name, value, contents)
+	}
+	return b.String(), names, nil
+}
+
+// DiscoverAgentProfiles loads user-owned Pi-compatible agent definitions from
+// $ATOM_HOME/agents. Project profiles stay unsupported until Atom has a project
+// trust boundary for executable instructions.
+func DiscoverAgentProfiles(home string) ([]AgentProfile, error) {
+	dir := filepath.Join(home, "agents")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read agents in %s: %w", dir, err)
+	}
+	var profiles []AgentProfile
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		profile, ok := parseAgentProfile(string(b))
+		if !ok {
+			continue
+		}
+		profile.Path = path
+		profiles = append(profiles, profile)
+	}
+	return profiles, nil
+}
+
+func AgentCatalog(profiles []AgentProfile) string {
+	if len(profiles) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Available specialized agents (use delegate with a bounded task when one fits):\n")
+	for _, profile := range profiles {
+		line := fmt.Sprintf("- %s: %s\n", profile.Name, profile.Description)
+		if b.Len()+len(line) > maxSkillCatalogChars {
+			b.WriteString("- agents omitted; use /agents to inspect full catalog.\n")
+			break
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func FindAgentProfile(profiles []AgentProfile, name string) (AgentProfile, error) {
+	var matches []AgentProfile
+	for _, profile := range profiles {
+		if profile.Name == name || profile.Path == name {
+			matches = append(matches, profile)
+		}
+	}
+	if len(matches) == 0 {
+		return AgentProfile{}, fmt.Errorf("unknown agent %q", name)
+	}
+	if len(matches) > 1 {
+		return AgentProfile{}, fmt.Errorf("agent %q is ambiguous; select one by path", name)
+	}
+	return matches[0], nil
+}
+
 type skillBase struct{ path, scope string }
 
 func normalizedOptions(options Options) Options {
@@ -277,4 +372,34 @@ func skillMetadata(contents string) (string, string) {
 		}
 	}
 	return values["name"], values["description"]
+}
+
+func parseAgentProfile(contents string) (AgentProfile, bool) {
+	lines := strings.Split(contents, "\n")
+	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
+		return AgentProfile{}, false
+	}
+	values := map[string]string{}
+	end := 0
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "---" {
+			end = i + 1
+			break
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if ok {
+			values[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), "\"'")
+		}
+	}
+	if end == 0 || values["name"] == "" || values["description"] == "" {
+		return AgentProfile{}, false
+	}
+	profile := AgentProfile{Name: values["name"], Description: values["description"], Model: values["model"], Prompt: strings.TrimSpace(strings.Join(lines[end:], "\n"))}
+	for _, name := range strings.Split(values["tools"], ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			profile.Tools = append(profile.Tools, name)
+		}
+	}
+	return profile, profile.Prompt != ""
 }

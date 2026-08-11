@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -76,6 +77,36 @@ func TestLoadSkillRejectsAmbiguousName(t *testing.T) {
 	_, err := LoadSkill([]Skill{{Name: "review", Path: "one"}, {Name: "review", Path: "two"}}, "review")
 	if err == nil {
 		t.Fatal("LoadSkill accepted an ambiguous name")
+	}
+}
+
+func TestDiscoverAgentProfilesReadsPiFormat(t *testing.T) {
+	home := t.TempDir()
+	mustWrite(t, filepath.Join(home, "agents", "audit.md"), "---\nname: audit\ndescription: Audit repository\nmodel: github-copilot/gpt-5.6-luna\ntools: read, grep\n---\nAudit only.")
+	mustWrite(t, filepath.Join(home, "agents", "invalid.md"), "no frontmatter")
+
+	profiles, err := DiscoverAgentProfiles(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles[0].Name != "audit" || profiles[0].Model != "github-copilot/gpt-5.6-luna" || !reflect.DeepEqual(profiles[0].Tools, []string{"read", "grep"}) || profiles[0].Prompt != "Audit only." {
+		t.Fatalf("profiles = %#v", profiles)
+	}
+	if !strings.Contains(AgentCatalog(profiles), "use delegate") {
+		t.Fatalf("catalog = %q", AgentCatalog(profiles))
+	}
+}
+
+func TestAutoLoadSkillsInjectsConfiguredLevel(t *testing.T) {
+	text, names, err := AutoLoadSkills([]Skill{{Name: "caveman", Path: "caveman.md"}}, map[string]string{"caveman": "full"})
+	if err == nil {
+		t.Fatal("expected missing skill file error")
+	}
+	path := filepath.Join(t.TempDir(), "SKILL.md")
+	mustWrite(t, path, "skill instructions")
+	text, names, err = AutoLoadSkills([]Skill{{Name: "caveman", Path: path}}, map[string]string{"caveman": "full"})
+	if err != nil || !reflect.DeepEqual(names, []string{"caveman"}) || !strings.Contains(text, "Activation value: full") || !strings.Contains(text, "skill instructions") {
+		t.Fatalf("text=%q names=%q error=%v", text, names, err)
 	}
 }
 

@@ -8,13 +8,14 @@ import (
 )
 
 type Config struct {
-	Provider                    string   `json:"provider"`
-	Model                       string   `json:"model"`
-	Effort                      string   `json:"effort,omitempty"`
-	AutoCompactAt               float64  `json:"auto_compact_at"`
-	BashTimeoutSeconds          int      `json:"bash_timeout_seconds"`
-	ProjectDocFallbackFilenames []string `json:"project_doc_fallback_filenames,omitempty"`
-	ProjectDocMaxBytes          int      `json:"project_doc_max_bytes,omitempty"`
+	Provider                    string            `json:"provider"`
+	Model                       string            `json:"model"`
+	Effort                      string            `json:"effort,omitempty"`
+	AutoLoadSkills              map[string]string `json:"auto_load_skills,omitempty"`
+	AutoCompactAt               float64           `json:"auto_compact_at"`
+	BashTimeoutSeconds          int               `json:"bash_timeout_seconds"`
+	ProjectDocFallbackFilenames []string          `json:"project_doc_fallback_filenames,omitempty"`
+	ProjectDocMaxBytes          int               `json:"project_doc_max_bytes,omitempty"`
 }
 
 func Defaults() Config {
@@ -56,6 +57,9 @@ func loadInto(cfg Config, path string) (Config, error) {
 	if overrides.Effort != nil {
 		cfg.Effort = *overrides.Effort
 	}
+	if overrides.AutoLoadSkills != nil {
+		cfg.AutoLoadSkills = *overrides.AutoLoadSkills
+	}
 	if overrides.AutoCompactAt != nil {
 		cfg.AutoCompactAt = *overrides.AutoCompactAt
 	}
@@ -73,13 +77,14 @@ func loadInto(cfg Config, path string) (Config, error) {
 }
 
 type configOverrides struct {
-	Provider                    *string   `json:"provider"`
-	Model                       *string   `json:"model"`
-	Effort                      *string   `json:"effort"`
-	AutoCompactAt               *float64  `json:"auto_compact_at"`
-	BashTimeoutSeconds          *int      `json:"bash_timeout_seconds"`
-	ProjectDocFallbackFilenames *[]string `json:"project_doc_fallback_filenames"`
-	ProjectDocMaxBytes          *int      `json:"project_doc_max_bytes"`
+	Provider                    *string            `json:"provider"`
+	Model                       *string            `json:"model"`
+	Effort                      *string            `json:"effort"`
+	AutoLoadSkills              *map[string]string `json:"auto_load_skills"`
+	AutoCompactAt               *float64           `json:"auto_compact_at"`
+	BashTimeoutSeconds          *int               `json:"bash_timeout_seconds"`
+	ProjectDocFallbackFilenames *[]string          `json:"project_doc_fallback_filenames"`
+	ProjectDocMaxBytes          *int               `json:"project_doc_max_bytes"`
 }
 
 func normalize(cfg Config) Config {

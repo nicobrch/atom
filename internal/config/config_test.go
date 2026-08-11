@@ -36,7 +36,7 @@ func TestLoadMergesGlobalThenProjectConfiguration(t *testing.T) {
 	if err := os.MkdirAll(global, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(global, "config.json"), []byte(`{"model":"global-model","bash_timeout_seconds":30}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(global, "config.json"), []byte(`{"model":"global-model","bash_timeout_seconds":30,"auto_load_skills":{"caveman":"full"}}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, ".atom", "config.json"), []byte(`{"model":"project-model","project_doc_max_bytes":65536}`), 0644); err != nil {
@@ -46,7 +46,7 @@ func TestLoadMergesGlobalThenProjectConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Model != "project-model" || cfg.BashTimeoutSeconds != 30 || cfg.ProjectDocMaxBytes != 65536 {
+	if cfg.Model != "project-model" || cfg.BashTimeoutSeconds != 30 || cfg.ProjectDocMaxBytes != 65536 || cfg.AutoLoadSkills["caveman"] != "full" {
 		t.Fatalf("merged config = %#v", cfg)
 	}
 }

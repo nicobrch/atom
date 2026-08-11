@@ -235,6 +235,48 @@ func TestSkillsAndCompactCommandsAreHandled(t *testing.T) {
 	m.turnCancel()
 }
 
+type delegatedCaptureProvider struct{ request agent.Request }
+
+func (p *delegatedCaptureProvider) Name() string { return "copilot" }
+func (p *delegatedCaptureProvider) Stream(_ context.Context, request agent.Request) (<-chan agent.StreamEvent, <-chan error) {
+	p.request = request
+	events := make(chan agent.StreamEvent, 1)
+	errs := make(chan error, 1)
+	events <- agent.StreamEvent{TextDelta: "audit complete"}
+	close(events)
+	close(errs)
+	return events, errs
+}
+
+func TestDelegateRunsProfileWithIsolatedToolsAndPrompt(t *testing.T) {
+	p := &delegatedCaptureProvider{}
+	read := testTool{name: "read"}
+	bash := testTool{name: "bash"}
+	parent := &agent.Loop{Provider: p, Model: "gpt-test", ReasoningEffort: "high", System: "base instructions"}
+	delegate := delegateTool{
+		profiles: []instructions.AgentProfile{{Name: "audit", Model: "github-copilot/gpt-profile", Prompt: "Never modify files.", Tools: []string{"read"}}},
+		parent:   parent, system: "base instructions", tools: []agent.Tool{read, bash},
+	}
+	output, err := delegate.Run(context.Background(), json.RawMessage(`{"agent":"audit","task":"inspect repository"}`))
+	if err != nil || output != "audit complete" {
+		t.Fatalf("output = %q, error = %v", output, err)
+	}
+	if len(p.request.Tools) != 1 || p.request.Tools[0].Name != "read" || !strings.Contains(p.request.System, "Never modify files.") || p.request.Model != "gpt-profile" {
+		t.Fatalf("delegated request = %#v", p.request)
+	}
+}
+
+func TestAutoSkillStatusShowsConfiguredLevels(t *testing.T) {
+	if got := autoSkillStatus(map[string]string{"ponytail": "full", "caveman": "ultra"}); got != "caveman ULTRA · ponytail FULL" {
+		t.Fatalf("status = %q", got)
+	}
+}
+
+type testTool struct{ name string }
+
+func (t testTool) Definition() agent.ToolDefinition                     { return agent.ToolDefinition{Name: t.name} }
+func (t testTool) Run(context.Context, json.RawMessage) (string, error) { return "", nil }
+
 func TestClearWaitsForActiveTurn(t *testing.T) {
 	m := appModel{busy: true, loop: &agent.Loop{Messages: []agent.Message{{Role: "user", Content: "keep"}}}}
 	got, _ := m.submit("/clear")
@@ -471,7 +513,7 @@ func TestViewStacksLowercaseVersionAndSubscriptionBesideLogo(t *testing.T) {
 		cfg:    config.Defaults(),
 	}
 	view := m.View()
-	versionIndex := strings.Index(view, "atom 0.3.1")
+	versionIndex := strings.Index(view, "atom 0.4.0")
 	subscriptionIndex := strings.Index(view, "Sign in required")
 	if versionIndex < 0 || subscriptionIndex < 0 {
 		t.Fatalf("header metadata missing from view: %q", view[:100])

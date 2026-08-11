@@ -43,3 +43,47 @@ Read relevant files, then report findings.
 
 Use `/skills` to list discovered skills and `/skill` to load one in the UI.
 Agents should load a relevant skill before applying its instructions.
+
+### Automatic skills
+
+Set `auto_load_skills` in `~/.atom/config.json` when a skill must apply to every
+turn. Map each skill name to its activation value:
+
+```json
+{
+  "auto_load_skills": {
+    "caveman": "full",
+    "ponytail": "full"
+  }
+}
+```
+
+Atom loads matching `SKILL.md` files into its startup system prompt and shows
+active values in the footer. Missing or ambiguous names stop startup instead
+of silently dropping required behavior. Leave a skill out of the map to keep
+progressive, on-demand loading.
+
+## Specialized agents
+
+Atom accepts Pi-compatible user agent definitions in `~/.atom/agents/*.md`:
+
+```md
+---
+name: repository-auditor
+description: Read-only repository audit
+model: github-copilot/gpt-5.6-luna
+tools: read, grep, bash, load_skill
+---
+
+Audit only. Never modify repository state.
+```
+
+Use `/agents` to inspect discovered profiles. Atom advertises them to the main
+agent through the `delegate` tool. Each delegation gets isolated conversation
+history, profile model and tool restrictions, current workspace instructions,
+and current skill catalog. Delegated agents cannot delegate recursively.
+
+Only user profiles under `$ATOM_HOME/agents` load. Project `.atom/agents` stay
+disabled until Atom has a project trust prompt. Profile tool names must match
+Atom tools (`read`, `write`, `edit`, `bash`, `grep`, or `load_skill`); unknown
+tools fail that delegation.
