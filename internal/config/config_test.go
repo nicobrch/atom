@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestSavePersistsModel(t *testing.T) {
 	dir := t.TempDir()
@@ -12,5 +16,30 @@ func TestSavePersistsModel(t *testing.T) {
 	got, err := Load(dir)
 	if err != nil || got.Model != cfg.Model {
 		t.Fatalf("model=%q err=%v", got.Model, err)
+	}
+}
+
+func TestLoadMergesGlobalThenProjectConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	global := filepath.Join(dir, "global")
+	t.Setenv("ATOM_HOME", global)
+	if err := os.MkdirAll(filepath.Join(dir, ".atom"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(global, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(global, "config.json"), []byte(`{"model":"global-model","bash_timeout_seconds":30}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".atom", "config.json"), []byte(`{"model":"project-model","project_doc_max_bytes":65536}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "project-model" || cfg.BashTimeoutSeconds != 30 || cfg.ProjectDocMaxBytes != 65536 {
+		t.Fatalf("merged config = %#v", cfg)
 	}
 }

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -92,16 +96,38 @@ func TestSelectionTextCopiesTranscriptAndInput(t *testing.T) {
 }
 
 func TestSkillsAndCompactCommandsAreHandled(t *testing.T) {
-	m := appModel{skills: []instructions.Skill{{Name: "review", Description: "Review code"}}}
+	m := appModel{skills: []instructions.Skill{{Name: "review", Description: "Review code", Scope: "repository", Path: "/repo/.agents/skills/review/SKILL.md"}}}
 	got, _ := m.submit("/skills")
 	m = got.(appModel)
-	if len(m.transcript) != 1 || m.transcript[0] != "review — Review code" {
+	if len(m.transcript) != 1 || m.transcript[0] != "review — Review code (repository, /repo/.agents/skills/review/SKILL.md)" {
 		t.Fatalf("skills transcript = %q", m.transcript)
 	}
 	got, cmd := m.submit("/compact")
 	m = got.(appModel)
 	if !m.busy || cmd == nil || m.transcript[len(m.transcript)-1] != "· compacting" {
 		t.Fatalf("compact state: busy=%v transcript=%q", m.busy, m.transcript)
+	}
+}
+
+func TestSkillToolUsesProgressiveDisclosure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(path, []byte("---\nname: review\ndescription: Review code\n---\nFull instructions"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	output, err := (skillTool{skills: []instructions.Skill{{Name: "review", Path: path}}}).Run(context.Background(), json.RawMessage(`{"name":"review"}`))
+	if err != nil || !strings.Contains(output, "Full instructions") {
+		t.Fatalf("load_skill output = %q, err = %v", output, err)
+	}
+}
+
+func TestBasePromptOnlySuppliesOperationalContext(t *testing.T) {
+	prompt := basePrompt("/workspace")
+	if !strings.Contains(prompt, "Working directory: /workspace") || !strings.Contains(prompt, "load_skill") {
+		t.Fatalf("base prompt is missing required operational context: %q", prompt)
+	}
+	if strings.Contains(prompt, "careful terminal coding agent") {
+		t.Fatalf("base prompt retains the removed persona: %q", prompt)
 	}
 }
 

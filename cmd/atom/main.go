@@ -134,11 +134,19 @@ func main() {
 		}
 		p = unavailableProvider{err}
 	}
-	agentsText, agentFiles, err := instructions.LoadAgents(wd)
+	atomHome, err := config.Home()
 	if err != nil {
 		fatal(err.Error())
 	}
-	skills, err := instructions.DiscoverSkills(wd)
+	instructionOptions := instructions.DefaultOptions()
+	instructionOptions.Home = atomHome
+	instructionOptions.ProjectDocFallbackNames = cfg.ProjectDocFallbackFilenames
+	instructionOptions.ProjectDocMaxBytes = cfg.ProjectDocMaxBytes
+	agentsText, agentFiles, err := instructions.LoadAgents(wd, instructionOptions)
+	if err != nil {
+		fatal(err.Error())
+	}
+	skills, err := instructions.DiscoverSkills(wd, instructionOptions)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -167,7 +175,9 @@ func main() {
 	} else {
 		obs = &terminal{out: os.Stdout}
 	}
-	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second)), System: system, Sink: store, Diagnostics: logStore, Observer: obs}
+	agentTools := toolsAsInterface(tool.NewRegistry(wd, time.Duration(cfg.BashTimeoutSeconds)*time.Second))
+	agentTools = append(agentTools, skillTool{skills: skills})
+	loop := &agent.Loop{Provider: p, Model: cfg.Model, ReasoningEffort: cfg.Effort, Tools: agentTools, System: system, Sink: store, Diagnostics: logStore, Observer: obs}
 	if sessionPath != "" {
 		messages, e := session.LoadMessages(sessionPath)
 		if e != nil {
@@ -265,6 +275,31 @@ func toolsAsInterface(r *tool.Registry) []agent.Tool { // registry deliberately 
 type registryTool struct {
 	r *tool.Registry
 	d agent.ToolDefinition
+}
+
+// skillTool supports the Agent Skills progressive-disclosure pattern: the
+// system prompt contains only metadata, and a model reads a matching SKILL.md
+// only when it needs that workflow.
+type skillTool struct{ skills []instructions.Skill }
+
+func (t skillTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name:        "load_skill",
+		Description: "Load the full SKILL.md instructions for a listed skill before using that skill's workflow.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Exact skill name, or its catalog path when the name is duplicated."}},"required":["name"],"additionalProperties":false}`),
+	}
+}
+func (t skillTool) Run(_ context.Context, raw json.RawMessage) (string, error) {
+	var args struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return "", fmt.Errorf("parse load_skill arguments: %w", err)
+	}
+	if strings.TrimSpace(args.Name) == "" {
+		return "", fmt.Errorf("name is required")
+	}
+	return instructions.LoadSkill(t.skills, args.Name)
 }
 
 type unavailableProvider struct{ err error }
@@ -560,7 +595,7 @@ func runInteractive(ctx context.Context, loop *agent.Loop, skills []instructions
 			continue
 		case line == "/skills":
 			for _, sk := range skills {
-				fmt.Printf("%s — %s\n", sk.Name, sk.Description)
+				fmt.Printf("%s — %s (%s, %s)\n", sk.Name, sk.Description, sk.Scope, sk.Path)
 			}
 			continue
 		case strings.HasPrefix(line, "/skill "):
@@ -1371,7 +1406,7 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 			m.add("no skills found")
 		}
 		for _, skill := range m.skills {
-			m.add(fmt.Sprintf("%s — %s", skill.Name, skill.Description))
+			m.add(fmt.Sprintf("%s — %s (%s, %s)", skill.Name, skill.Description, skill.Scope, skill.Path))
 		}
 	case "/skill":
 		if m.busy {
@@ -1385,7 +1420,7 @@ func (m appModel) submit(line string) (tea.Model, tea.Cmd) {
 		m.menuTitle, m.menuKind, m.selected = "Load skill", "skill", 0
 		m.menu = make([]string, len(m.skills))
 		for i, skill := range m.skills {
-			m.menu[i] = skill.Name
+			m.menu[i] = skill.Path
 		}
 	case "/compact":
 		if m.busy {
@@ -1717,6 +1752,6 @@ func authSource(p agent.Provider) string {
 }
 
 func basePrompt(wd string) string {
-	return fmt.Sprintf(`You are Atom, a careful terminal coding agent. Work in %s. Use tools to inspect before changing files. Keep changes scoped, run relevant tests, and report what changed. Never claim a command succeeded unless its output confirms it. Respect all AGENTS.md instructions.`, wd)
+	return fmt.Sprintf(`You are Atom. Working directory: %s. Follow the provided AGENTS.md instructions. Before using a relevant or requested skill, call load_skill and follow its SKILL.md.`, wd)
 }
 func fatal(s string) { fmt.Fprintln(os.Stderr, "atom:", s); os.Exit(1) }

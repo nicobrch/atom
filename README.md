@@ -6,7 +6,7 @@ surface area:
 
 - OpenAI and GitHub Copilot adapters behind one streaming provider interface
 - An agent loop with `read`, `write`, `edit`, `bash`, and `grep`
-- `AGENTS.md` discovery and small, file-based skills
+- Codex-compatible layered `AGENTS.md` guidance and Agent Skills
 - A quick ANSI terminal UI plus print mode for scripts
 - Explicit and automatic context compaction
 
@@ -108,12 +108,39 @@ owner-only the next time Atom opens them.
 
 ## Project customization
 
-Atom loads every `AGENTS.md` from the workspace root down to the working
-directory. Put a skill in either `.atom/skills/<name>/SKILL.md` or
-`~/.atom/skills/<name>/SKILL.md`; the agent sees each skill's name and
-description. A user can explicitly load one with `/skill <name>`.
+Atom follows the OpenAI/Codex instruction and Agent Skills conventions.
 
-The optional `.atom/config.json` can provide defaults:
+- Global guidance: `$ATOM_HOME/AGENTS.override.md`, otherwise
+  `$ATOM_HOME/AGENTS.md` (`ATOM_HOME` defaults to `~/.atom`).
+- Project guidance: from the repository root through Atom's current directory,
+  Atom uses the first non-empty file per directory in this order:
+  `AGENTS.override.md`, `AGENTS.md`, then configured fallback names. Guidance is
+  concatenated from broadest to most specific, so the closest file wins.
+- Repository skills: `.agents/skills/<name>/SKILL.md` in every directory from
+  the repository root to the current directory.
+- User skills: `~/.agents/skills/<name>/SKILL.md`; admin skills:
+  `/etc/atom/skills/<name>/SKILL.md`.
+
+Each `SKILL.md` must begin with the standard frontmatter:
+
+```md
+---
+name: review
+description: Review a pull request for correctness and security regressions.
+---
+
+Skill instructions and optional references, scripts, or assets.
+```
+
+Atom initially supplies only skill metadata to the model; it automatically
+loads the full `SKILL.md` through its `load_skill` tool when a skill is
+relevant. You can also load one manually with `/skill <name>`. If duplicate
+skill names exist, select the desired skill by its displayed path. This preserves the Agent Skills standard's
+non-merging behavior for duplicate names.
+
+Settings are global then project-specific: `$ATOM_HOME/config.json` is loaded
+first and `.atom/config.json` overrides only the fields it declares. The
+project file can provide defaults:
 
 ```json
 {
@@ -121,9 +148,14 @@ The optional `.atom/config.json` can provide defaults:
   "model": "gpt-5.4",
   "context_tokens": 128000,
   "auto_compact_at": 0.80,
-  "bash_timeout_seconds": 120
+  "bash_timeout_seconds": 120,
+  "project_doc_fallback_filenames": ["TEAM_GUIDE.md"],
+  "project_doc_max_bytes": 65536
 }
 ```
+
+`project_doc_max_bytes` defaults to 32 KiB. Empty instruction files are
+ignored; discovery stops before exceeding the configured limit.
 
 ## Architecture
 
